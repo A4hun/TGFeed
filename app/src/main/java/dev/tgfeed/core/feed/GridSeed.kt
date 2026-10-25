@@ -19,7 +19,7 @@ import dev.tgfeed.core.td.VideoItem
 // 容器口 App.addBatchToGrid（App.kt，本件消费方）之后，任何新列表面接入 = 一行：
 // 钮回调传 List<VideoItem> → addBatchToGrid(来源, items) + 容器 showGrid()。
 //
-// 纪律：纯 Kotlin 零 Android 依赖（JVM 单测直测，PlayChain/ListenQueueModel 同款）；
+// 纪律：纯 Kotlin 零 Android 依赖（JVM 单测直测）；
 // 分屏播放引擎零碰（GridScreen 本体零刀，种子路全在容器/调用方侧）。
 
 /**
