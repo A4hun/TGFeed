@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.TgFeed" parent="android:Theme.Material.NoActionBar">
+        <!-- R52：纯黑窗口背景换成品牌启动页（黑底+居中 logo），治冷启动黑屏 -->
+        <item name="android:windowBackground">@drawable/splash_brand</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

@@ -1,0 +1,19 @@
+# ---- 构建产物 ----
+build/
+*/build/
+.gradle/
+
+# ---- 本机密件（绝不进库） ----
+local.properties
+*.keystore
+app/libs/*.aar
+
+# ---- IDE ----
+.idea/
+*.iml
+.cxx/
+.externalNativeBuild/
+
+# ---- 系统杂项 ----
+.DS_Store
+Thumbs.db

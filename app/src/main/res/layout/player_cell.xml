@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 网格/多窗格专用 PlayerView：TextureView 渲染（普通 View 层级，遵守裁剪），
+     ZOOM 裁切填满格子。SurfaceView 是独立硬件图层，会穿透 Compose 的 clipToBounds。 -->
+<androidx.media3.ui.PlayerView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    app:surface_type="texture_view"
+    app:resize_mode="zoom"
+    app:use_controller="false" />

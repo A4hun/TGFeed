@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- R382：app_name 迁至 buildTypes resValue（debug=「TGFeed（开发）」/release=「TGFeed」）
+         ——双包共存的桌面可辨性；此处不再定义防资源合并冲突。 -->
+</resources>

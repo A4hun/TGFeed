@@ -1,0 +1,7 @@
+# Android SDK 路径（首次构建时按实际安装位置填写）
+sdk.dir=C:\\Users\\<你的用户名>\\AppData\\Local\\Android\\Sdk
+
+# Telegram API 凭证（到 https://my.telegram.org 申请）
+# 留空则 App 进入演示模式（Mock 数据源，无需登录即可体验竖滑播放）
+API_ID=
+API_HASH=

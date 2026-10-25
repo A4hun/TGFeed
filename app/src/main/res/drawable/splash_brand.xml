@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- R52 冷启动品牌页：系统窗口首绘即显示（不等进程内任何代码执行），
+     黑底 + 居中 logo（复用启动图标前景矢量）。Compose 首帧的品牌启动页
+     （MainActivity startupWaiting）与它同底同位，视觉无缝衔接——
+     杀进程重进不再是"黑屏 + 裸转圈"。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@android:color/black" />
+    <item
+        android:drawable="@drawable/ic_launcher_foreground"
+        android:gravity="center" />
+</layer-list>

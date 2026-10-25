@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 后台音频模式：前台服务基础权限 + mediaPlayback 类型权限（targetSdk 34 必需） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- R45：索引构建前台服务（dataSync 类型，targetSdk 34 必需） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Android 13+ 通知运行时权限（需 MainActivity 侧请求，未授权时服务仍保活但通知不进抽屉） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 熄屏继续播放的 CPU 唤醒锁（PlayerPool setWakeMode 用） -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 系统级悬浮窗（退桌面/切 App 后继续悬浮播放）：运行时检查 Settings.canDrawOverlays，
+         未授权走系统设置页引导（MainActivity/FloatingPlayerHost），拒绝则回落 App 内浮层 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- 平板/折叠屏/自由窗口适配：显式声明全尺寸屏幕支持（默认即为 true，显式写出防止 OEM 商店过滤误判） -->
+    <supports-screens
+        android:smallScreens="true"
+        android:normalScreens="true"
+        android:largeScreens="true"
+        android:xlargeScreens="true"
+        android:anyDensity="true" />
+
+    <!-- 声明非必需触摸屏，避免未来在车机/投屏设备等无触摸屏环境被安装过滤 -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <!-- R277：星图 OpenGL 场景层用 ES 3.0（required=false——不支持的设备走 Canvas
+         渲染器双轨兜底，运行期探针闸（GlSceneView.probeEs3）实测裁决，不靠商店过滤） -->
+    <uses-feature
+        android:glEsVersion="0x00030000"
+        android:required="false" />
+
+    <application
+        android:name=".App"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:supportsRtl="true"
+        android:resizeableActivity="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.TgFeed">
+
+        <!-- singleTop：应用已在栈顶时，t.me 深链走 onNewIntent 复用现实例（不再叠一个新
+             Activity）；不在栈顶时正常新建。singleTask 会清掉上层页，返回栈语义变化大，不需要 -->
+        <!-- supportsPictureInPicture：系统画中画（真悬浮窗）。弹着 App 内悬浮窗退后台时
+             进 PiP，视频在桌面小窗续播。configChanges 已含 screenSize|screenLayout|
+             smallestScreenSize|orientation——PiP 进出不重建 Activity，组合与播放器全程存活 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTop"
+            android:supportsPictureInPicture="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- t.me 深链：浏览器/其他 App/分享点击 t.me 链接时，tgfeed 出现在系统选择器。
+                 不做 autoVerify（t.me 域名所有权校验无法通过，配了反而整条 filter 失效），
+                 普通 intent-filter 走系统选择器即可。同一 filter 内多个 <data> 的属性做
+                 笛卡尔组合匹配：http/https × t.me/www.t.me 四种组合全收。
+                 android:label 让用户在选择器里认出「TGFeed」 -->
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:host="t.me" />
+                <data android:host="www.t.me" />
+            </intent-filter>
+
+            <!-- tg:// 内部协议链接（tg://resolve?domain=<name>&post=<msgId> 等），
+                 官方客户端分享/网页"View in Telegram"按钮产出这种形态 -->
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="tg" />
+            </intent-filter>
+        </activity>
+
+        <!-- 后台音频保活服务：仅保活进程 + 媒体通知，真实播放仍归 PlayerPool -->
+        <service
+            android:name=".core.playback.AudioBackgroundService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- 系统悬浮窗保活服务：有悬浮窗在飞即运行、全关即停；通知为 IMPORTANCE_MIN
+             静默渠道（不出声不占状态栏），窗口与播放器的真实管理在 ui.floating 包 -->
+        <service
+            android:name=".ui.floating.SystemFloatingService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- R45 索引构建保活服务：bulk 爬取期挂前台（退后台/熄屏继续爬），队列清空即停；
+             通知为 IMPORTANCE_MIN 静默渠道（"正在构建搜索索引 x/y"），爬取本体在
+             FeedViewModel 协程，本服务只是保活挂牌壳 -->
+        <service
+            android:name=".core.feed.IndexCrawlService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>
