@@ -2351,6 +2351,21 @@ fun FeedScreen(
                     // 关窗不再自己置 false：行点击侧 sheet.dismiss 播完退场动画后
                     // 统一走 onDismiss（落组合一处收口）
                 },
+                // R397 批量入分屏（合集行「分屏播放」收口）：对话框只负责现拉（空结果
+                // 留面板如实提示），这里种进容器片单 + 如实报账 + 开分屏——showGrid 后
+                // viewMode="grid"，FeedScreen（含本抽屉）整层退场让位 GridScreen
+                onBatchToGrid = { items ->
+                    val added = appContainer.addBatchToGrid("合集", items)
+                    android.widget.Toast.makeText(
+                        context,
+                        if (added == 0) "这批都已在分屏片单里"
+                        else "已加入分屏 $added 条" +
+                            if (added < items.size) "（重复 ${items.size - added} 条已跳过）" else "",
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                    showCollections = false
+                    appContainer.showGrid()
+                },
             )
         }
 

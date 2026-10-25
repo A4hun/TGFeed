@@ -1,5 +1,6 @@
 package dev.tgfeed.ui.components
 
+import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -18,10 +19,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.MoreHoriz
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -47,9 +51,11 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.tgfeed.core.feed.ChannelCollection
 import dev.tgfeed.core.feed.FeedViewModel
 import dev.tgfeed.core.feed.FeedViewModelFactory
+import dev.tgfeed.core.feed.fetchCollectionSeed
 import dev.tgfeed.core.td.ChannelBrief
 import dev.tgfeed.core.td.TdGateway
 import dev.tgfeed.core.td.TdLibGateway
+import dev.tgfeed.core.td.VideoItem
 import dev.tgfeed.ui.components.kit.AppDialog
 import dev.tgfeed.ui.components.kit.AppSheetMotion
 import dev.tgfeed.ui.components.kit.SheetAnchor
@@ -75,6 +81,12 @@ import kotlinx.coroutines.withContext
  *
  * 视觉：全链路 TgFeedTokens 深色语言（旧版 M3 默认配色直出已收编）。
  *
+ * R397 批量入分屏（六入口之四·合集 UI = CollectionFeedSource 所在面）：合集/房间
+ * 行尾「分屏播放」文字钮——现拉该合集首轮内容（fetchCollectionSeed 单轮 48，源内
+ * shuffle 天然多频道打散）种进分屏片单并直接开分屏。**钮面无数判词**：合集=纯频道
+ * 集合，无在位条目数，带数=编造；实数在拉后由宿主 Toast/探针落实。空结果（离线/
+ * 坏档/频道全失败）如实 Toast 留面板，不编造不重试。
+ *
  * 注意：面板内容继承调用处的 CompositionLocal，viewModel(factory = …) 拿到的
  * 是与 FeedScreen 同一个 Activity 作用域的共享 FeedViewModel 实例。
  */
@@ -84,6 +96,9 @@ fun CollectionsDialog(
     gateway: TdGateway,
     onDismiss: () -> Unit,
     onSelect: (ChannelCollection) -> Unit,
+    // R397 批量入分屏：宿主（FeedScreen）收口——种进容器片单 + 开分屏；
+    // 本回调只在现拉非空后触发（items 即首轮实拉结果）
+    onBatchToGrid: (List<VideoItem>) -> Unit = {},
 ) {
     val app = LocalContext.current.applicationContext as android.app.Application
     // 必须带网关 key：与 FeedScreen 共享同一 activity 作用域 VM，
@@ -127,6 +142,30 @@ fun CollectionsDialog(
         shareBusy = false
         shareError = null
         shareResult = null
+    }
+
+    // R397 批量入分屏：现拉目标（行级转圈依据——单飞口径，一次只拉一个合集）
+    var seedTarget by remember { mutableStateOf<ChannelCollection?>(null) }
+
+    /**
+     * 现拉合集首轮 → 批量入分屏（doGenerate 同款协程形态：IO 拉取 + Main 回填）。
+     * 空结果如实 Toast 留面板（诚实口径：离线/坏档不编造）；非空交宿主收口
+     * （种进片单 + 开分屏——开格后本抽屉随 FeedScreen 退场自然消亡）。
+     */
+    fun seedToGrid(c: ChannelCollection) {
+        if (seedTarget != null) return // 单飞：在拉中不重复发
+        seedTarget = c
+        shareScope.launch(Dispatchers.IO) {
+            val items = runCatching { fetchCollectionSeed(gateway, c) }.getOrDefault(emptyList())
+            withContext(Dispatchers.Main) {
+                seedTarget = null
+                if (items.isEmpty()) {
+                    Toast.makeText(context, "「${c.name}」这轮没拉到内容，稍后再试", Toast.LENGTH_SHORT).show()
+                } else {
+                    onBatchToGrid(items)
+                }
+            }
+        }
     }
 
     /**
@@ -207,6 +246,10 @@ fun CollectionsDialog(
                             // 房间是本地聚类产物（无删除语义）：… 与长按都直达礼包分享
                             onMore = { openShare(room, deletable = false) },
                             onLongClick = { openShare(room, deletable = false) },
+                            // R397：房间同为 CollectionFeedSource 消费面（showSmartRoom
+                            // 走同源聚合）——批量入分屏同权开放
+                            onSeed = { seedToGrid(room) },
+                            seeding = seedTarget == room,
                         )
                     }
                 }
@@ -235,6 +278,9 @@ fun CollectionsDialog(
                             // 显式「…」入口（R137）：点开礼包分享面板（长按保留为快捷方式）
                             onMore = { openShare(c, deletable = true) },
                             onLongClick = { openShare(c, deletable = true) },
+                            // R397 批量入分屏：现拉首轮铺格（钮面无数判词见 CollectionsDialog KDoc）
+                            onSeed = { seedToGrid(c) },
+                            seeding = seedTarget == c,
                         )
                     }
                 }
@@ -349,7 +395,8 @@ fun CollectionsDialog(
 }
 
 /**
- * 合集条目行：名称 + "N 个频道" + 频道名摘要；单击选择、尾随「…」或长按进礼包分享面板。
+ * 合集条目行：名称 + "N 个频道" + 频道名摘要；单击选择、尾随「分屏播放」（R397，
+ * seeding=行级转圈）+「…」或长按进礼包分享面板。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -359,6 +406,9 @@ private fun CollectionRow(
     onClick: () -> Unit,
     onMore: () -> Unit,
     onLongClick: () -> Unit,
+    // R397 批量入分屏行尾钮（null=不显示——预留给未来不需要种子的行形态）
+    onSeed: (() -> Unit)? = null,
+    seeding: Boolean = false,
 ) {
     // 把 id 解析成频道标题（未加载到的显示原始 id），取前 3 个做摘要
     val titles = collection.channelIds
@@ -387,6 +437,36 @@ private fun CollectionRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+        }
+        // R397 批量入分屏：现拉首轮铺格（无数判词=纯频道集合无在位条目数，带数=编造）；
+        // seeding 中钮内转圈（IO 在拉），单飞闸防重复发
+        if (onSeed != null) {
+            TextButton(
+                onClick = onSeed,
+                enabled = !seeding,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                if (seeding) {
+                    CircularProgressIndicator(
+                        Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = TgFeedTokens.AccentRed,
+                    )
+                } else {
+                    Icon(
+                        Icons.Outlined.GridView,
+                        contentDescription = "分屏播放",
+                        tint = TgFeedTokens.AccentRed,
+                        modifier = Modifier.size(TgFeedTokens.IconMd),
+                    )
+                }
+                Spacer(Modifier.width(TgFeedTokens.GapXs))
+                Text(
+                    "分屏播放",
+                    color = TgFeedTokens.AccentRed,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
         }
         // 显式「…」入口：礼包分享/删除面板（长按不再是唯一入口）
         IconButton(onClick = onMore) {

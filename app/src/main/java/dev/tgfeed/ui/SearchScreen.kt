@@ -42,6 +42,7 @@ import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.MusicNote
 import androidx.compose.material.icons.outlined.Photo
 import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.SearchOff
 import androidx.compose.material.icons.outlined.Tune
@@ -49,6 +50,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
@@ -151,6 +153,10 @@ import kotlinx.coroutines.withContext
  *    消费器 openSearch(令牌)→initialQuery 恒等于本词，R107/H5「结果属于本词」判定恒
  *    命中=零重搜零 liveAsk 重发，返回页首帧结果瞬时在场（本地层毫秒补跑）；
  *  # 开头查询走双模式（话题精确 + 全文宽泛，网关层合并），搜索框下方有解释文案。
+ *  - R397 批量入分屏：结果区头部（排序 chips 行下、两路图例上）「分屏播放 N 条」
+ *    文字钮——把当前所见结果（mergedResults，混排去重+排序+类型筛选后=屏幕所显）
+ *    整批种进分屏片单并直接开分屏（统一机制 App.addBatchToGrid；null playUri 的
+ *    本地命中条目入格后走格内 ensurePlayable 现拉，与 Feed 侧同款链）。
  */
 @Composable
 fun SearchScreen(
@@ -164,6 +170,10 @@ fun SearchScreen(
     // 不挂默认值：本函数体巨大，默认参数掩码叠加触发过 ART VerifyError（实证），
     // 唯一调用方 MainActivity 已显式传入
     onOpenChannel: (Long, String) -> Unit,
+    // R397 批量入分屏：宿主（MainActivity）收口——种进容器片单 + 剥落本页 + 开分屏。
+    // 实数在钮文案（mergedResults.size），实增数/重复数由宿主 Toast 如实报账。
+    // 同上不挂默认值（VerifyError 纪律，唯一调用方显式传入）
+    onBatchToGrid: (List<VideoItem>) -> Unit,
 ) {
     val app = LocalContext.current.applicationContext as android.app.Application
     // 与 FeedScreen 同一实例的共享 VM（同 key）：全量搜索状态跨页共享，onPlay 切源也切在它身上
@@ -913,6 +923,25 @@ fun SearchScreen(
                                                 prefs.searchSortOrder = o.name
                                             }
                                         },
+                                    )
+                                }
+                            }
+                            // R397 批量入分屏（六入口之一·搜索结果页）：当前所见=种子集——
+                            // mergedResults 已是混排去重+排序+类型筛选后的上屏口径，所见即所种。
+                            // 文字钮与 DemandSubscribeRow/排序 chips 同族语言（结果区头部不抢网格空间）
+                            if (mergedResults.isNotEmpty()) {
+                                TextButton(
+                                    onClick = { onBatchToGrid(mergedResults.map { it.first }) },
+                                ) {
+                                    Icon(
+                                        Icons.Outlined.GridView,
+                                        contentDescription = null,
+                                        tint = TgFeedTokens.AccentRed,
+                                    )
+                                    Spacer(Modifier.width(TgFeedTokens.GapXs))
+                                    Text(
+                                        "分屏播放 ${mergedResults.size} 条",
+                                        color = TgFeedTokens.AccentRed,
                                     )
                                 }
                             }

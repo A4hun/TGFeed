@@ -236,7 +236,33 @@ internal fun FeedViewModel.showFollowingImpl() {
         if (_items.value.isNotEmpty()) return@launch
         val (seenK, seenU) = runCatching { store.loadSeenIdentities() }
             .getOrDefault(emptySet<String>() to emptySet())
-        val snapFresh = snap.items.filter { !SeenDedupPolicy.isSeen(it, seenK, seenU) }
+        // R390 类型/可见性对齐主 Feed 过滤链（scanFresh 置顶路同款判词）：快照垫底
+        // 同样直插 _items、绕过 loadMore 的 pass 谓词——快照由预热实例按全部类型
+        // 采集=混合内容，用户当前媒体 tab=视频时混合快照会把图文/音频条目摆进
+        // 视频 tab（用户实锤「关注界面选视频内容出现图片资源」；网络首拉只追加
+        // 不去除，图片一直挂到手动刷新）。六道与 pass 谓词同口径：单类型 tab /
+        // 设置页类型开关 / 内容筛选 / 屏蔽频道 / 不感兴趣 / 永久指纹。
+        val typePrefsR390 = dev.tgfeed.core.prefs.AppPrefs(app)
+        val blockedChR390 = _blockedChannels.value
+        val dislikedKR390 = _dislikedKeys.value
+        val permBlockedKeysR390 = _blockedItems.value.mapTo(HashSet()) { it.key }
+        val permBlockedUidsR390 = _blockedItems.value.mapNotNullTo(HashSet()) { b ->
+            b.fileUniqueId.takeIf { it.isNotEmpty() }
+        }
+        val snapFresh = snap.items.filter {
+            !SeenDedupPolicy.isSeen(it, seenK, seenU) &&
+                SnapshotReplayPolicy.typeAligned(
+                    it,
+                    _mediaTypeTab.value,
+                    typePrefsR390.showVideos,
+                    typePrefsR390.showPhotos,
+                    typePrefsR390.showAudio,
+                    _filter.value,
+                ) &&
+                it.chatId !in blockedChR390 &&
+                it.key !in dislikedKR390 &&
+                !SeenDedupPolicy.isSeen(it, permBlockedKeysR390, permBlockedUidsR390)
+        }
         if (snapFresh.isEmpty()) return@launch
         _items.value = snapFresh
         snapshotKeys = snapFresh.mapTo(HashSet()) { it.key }

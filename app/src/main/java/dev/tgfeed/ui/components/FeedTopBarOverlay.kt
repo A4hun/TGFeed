@@ -13,6 +13,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -75,6 +76,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
@@ -1051,7 +1053,14 @@ private fun livenessText(
  * （点=钉住+立即建库）；在爬=spinner+行内"已索引 N 条"进度；完成=✓（5s 闪示）；
  * 已钉=填充蓝（点=确认弹窗取消钉——复用"已追"胶囊的防误触确认范式）。
  * 相似/胶囊/深索引钮点击不选中频道、不关窗；点卡片本体选中频道并关窗。
+ * R396 抽屉比例收窄（0.45f 屏宽）适配：窄抽屉里单行放不下（行固定件 ~203dp >
+ * 竖屏 0.45 抽屉可用 ~153dp）——可用宽 < [ChannelCardCompactMin] 改两段布局
+ * （首行头像+名+信号，次行深索引/相似/追钮组），以上保持单行全件（横屏/平板
+ * 零行为变化）。钮件/头像/标题块抽共用件（两形态同源防漂移）。
  */
+
+/** R396 频道行窄态阈值：可用宽低于它即两段布局（竖屏 0.45 抽屉 ~153dp 入窄态，横屏 ~369dp 单行） */
+private val ChannelCardCompactMin = 300.dp
 @Composable
 private fun ChannelCard(
     channel: ChannelBrief,
@@ -1136,136 +1145,219 @@ private fun ChannelCard(
         )
     }
 
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(horizontal = TgFeedTokens.GapLg, vertical = TgFeedTokens.GapSm),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        if (avatarImage != null) {
-            // 真头像：圆形裁剪，非方形图居中裁满
-            Image(
-                bitmap = avatarImage,
-                contentDescription = channel.title,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape),
-            )
-        } else {
-            // 回落：圆形字母头像（频道名首字大写，底色按 id 稳定取色）
-            Box(
+    // R396 双形态：可用宽 < ChannelCardCompactMin → 窄抽屉两段布局（首行头像+名+
+    // 信号，次行钮组右沉追尾）；否则单行全件（历史布局零变化）。回调两形态共用：
+    // 已追点=先弹确认，已钉点=先弹取消钉确认（防误触范式不变）
+    BoxWithConstraints {
+        val requestDeepIndex: () -> Unit = {
+            if (manualState?.pinned == true) confirmUnpinDeepIndex = true
+            else onRequestDeepIndex()
+        }
+        val toggleFollow: () -> Unit = {
+            if (subscribed) confirmUnfollow = true else onToggleSubscription()
+        }
+        if (maxWidth < ChannelCardCompactMin) {
+            // 窄态（竖屏 0.45 抽屉）：单行固定件挤不下，钮组整组收纳到次行——
+            // 首行纯「头像+名+信号」保频道名录完整可读，次行深索引/相似居左、追右沉
+            Column(
                 Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .background(avatarColor(channel.id)),
-                contentAlignment = Alignment.Center,
+                    .fillMaxWidth()
+                    .clickable(onClick = onClick)
+                    .padding(horizontal = TgFeedTokens.GapLg, vertical = TgFeedTokens.GapSm),
             ) {
-                Text(
-                    channel.title.firstOrNull()?.uppercase() ?: "?",
-                    color = TgFeedTokens.TextHigh,
-                    style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold),
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    ChannelAvatarSlot(channel, avatarImage)
+                    Spacer(Modifier.width(TgFeedTokens.GapMd))
+                    ChannelTitleBlock(channel, signal, Modifier.weight(1f))
+                }
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    ChannelDeepIndexButton(manualState = manualState, onClick = requestDeepIndex)
+                    Spacer(Modifier.width(TgFeedTokens.GapXs))
+                    ChannelSimilarButton(onClick = onFindSimilar)
+                    Spacer(Modifier.weight(1f))
+                    ChannelFollowPill(subscribed = subscribed, onClick = toggleFollow)
+                }
             }
-        }
-        Spacer(Modifier.width(TgFeedTokens.GapMd))
-        // 频道名 + 鲜活信号行：weight(1f) 先为右侧"相似/胶囊"两个固定位留宽，
-        // 长名在固定位之前截断为"…"（沿用 B11 口径）；信号行仅索引已覆盖时显示
-        Column(
-            Modifier
-                .weight(1f)
-                .padding(end = TgFeedTokens.GapSm),
-        ) {
-            Text(
-                channel.title,
-                color = TgFeedTokens.TextHigh,
-                style = MaterialTheme.typography.bodyLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (signal != null) {
-                Text(
+        } else {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onClick)
+                    .padding(horizontal = TgFeedTokens.GapLg, vertical = TgFeedTokens.GapSm),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ChannelAvatarSlot(channel, avatarImage)
+                Spacer(Modifier.width(TgFeedTokens.GapMd))
+                // 频道名 + 鲜活信号行：weight(1f) 先为右侧"相似/胶囊"两个固定位留宽，
+                // 长名在固定位之前截断为"…"（沿用 B11 口径）；信号行仅索引已覆盖时显示
+                ChannelTitleBlock(
+                    channel,
                     signal,
-                    color = TgFeedTokens.TextLow,
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 2.dp),
+                    Modifier
+                        .weight(1f)
+                        .padding(end = TgFeedTokens.GapSm),
                 )
+                ChannelDeepIndexButton(manualState = manualState, onClick = requestDeepIndex)
+                Spacer(Modifier.width(TgFeedTokens.GapXs))
+                // 相似文字钮（替代 ✨ 图标）：只触发回调，不选中频道不关窗
+                ChannelSimilarButton(onClick = onFindSimilar)
+                Spacer(Modifier.width(TgFeedTokens.GapXs))
+                // 追/已追文字胶囊（替代铃铛图标）：未追 SurfaceHigh 底，已追电报蓝浅底蓝字；
+                // 已追态点击先弹确认再退追
+                ChannelFollowPill(subscribed = subscribed, onClick = toggleFollow)
             }
         }
-        // R191「深度索引」图标钮（索引明细区旁）：未钉=描线 Storage（点=钉住+立即
-        // 建库）；在爬=小 spinner；完成=✓ 闪示（SuccessGreen）；已钉=填充 Storage
-        // （TgBlue=已追胶囊同款"已建立"色语义；点=确认取消钉）。只触发回调，
-        // 不选中频道不关窗——触点 32dp 与相邻控件同密度
+    }
+}
+
+// ---------- R396 频道行共用件（宽/窄两形态同源，防两处漂移） ----------
+
+/**
+ * 频道头像槽：真头像圆形裁剪（非方形图居中裁满）；无图/解码未到回落字母圆
+ * （频道名首字大写，底色按 id 稳定取色）。
+ */
+@Composable
+private fun ChannelAvatarSlot(channel: ChannelBrief, avatarImage: ImageBitmap?) {
+    if (avatarImage != null) {
+        // 真头像：圆形裁剪，非方形图居中裁满
+        Image(
+            bitmap = avatarImage,
+            contentDescription = channel.title,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .size(40.dp)
+                .clip(CircleShape),
+        )
+    } else {
+        // 回落：圆形字母头像（频道名首字大写，底色按 id 稳定取色）
         Box(
             Modifier
-                .size(32.dp)
+                .size(40.dp)
                 .clip(CircleShape)
-                .clickable {
-                    if (manualState?.pinned == true) confirmUnpinDeepIndex = true
-                    else onRequestDeepIndex()
-                },
+                .background(avatarColor(channel.id)),
             contentAlignment = Alignment.Center,
         ) {
-            when {
-                manualState?.building == true -> CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    color = TgFeedTokens.TgBlue,
-                    strokeWidth = 2.dp,
-                )
-                manualState != null && dev.tgfeed.core.feed.manualRowShowCheck(manualState) -> Icon(
-                    Icons.Filled.Check,
-                    contentDescription = "深度索引完成",
-                    tint = TgFeedTokens.SuccessGreen,
-                    modifier = Modifier.size(18.dp),
-                )
-                manualState?.pinned == true -> Icon(
-                    Icons.Filled.Storage,
-                    contentDescription = "深度索引已钉住，点按取消",
-                    tint = TgFeedTokens.TgBlue,
-                    modifier = Modifier.size(18.dp),
-                )
-                else -> Icon(
-                    Icons.Outlined.Storage,
-                    contentDescription = "深度索引",
-                    tint = TgFeedTokens.TextLow,
-                    modifier = Modifier.size(18.dp),
-                )
-            }
-        }
-        Spacer(Modifier.width(TgFeedTokens.GapXs))
-        // 相似文字钮（替代 ✨ 图标）：只触发回调，不选中频道
-        Text(
-            "相似",
-            color = TgFeedTokens.TextLow,
-            style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier
-                .clip(RoundedCornerShape(TgFeedTokens.RadiusPill))
-                .clickable(onClick = onFindSimilar)
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-        )
-        Spacer(Modifier.width(TgFeedTokens.GapXs))
-        // 追/已追文字胶囊（替代铃铛图标）：未追 SurfaceHigh 底，已追电报蓝浅底蓝字；
-        // 已追态点击先弹确认再退追
-        Box(
-            Modifier
-                .clip(RoundedCornerShape(TgFeedTokens.RadiusPill))
-                .background(
-                    if (subscribed) TgFeedTokens.TgBlue.copy(alpha = 0.22f)
-                    else TgFeedTokens.SurfaceHigh,
-                )
-                .clickable {
-                    if (subscribed) confirmUnfollow = true else onToggleSubscription()
-                }
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-        ) {
             Text(
-                if (subscribed) "已追" else "追",
-                color = if (subscribed) TgFeedTokens.TgBlue else TgFeedTokens.TextHigh,
-                style = MaterialTheme.typography.labelMedium,
+                channel.title.firstOrNull()?.uppercase() ?: "?",
+                color = TgFeedTokens.TextHigh,
+                style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold),
             )
         }
+    }
+}
+
+/**
+ * 频道名 + 鲜活信号行（竖排）：长名单行省略；信号行仅索引已覆盖时显示。
+ * modifier 由两形态自定（宽态 weight+end 留白，窄态纯 weight）。
+ */
+@Composable
+private fun ChannelTitleBlock(channel: ChannelBrief, signal: String?, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(
+            channel.title,
+            color = TgFeedTokens.TextHigh,
+            style = MaterialTheme.typography.bodyLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (signal != null) {
+            Text(
+                signal,
+                color = TgFeedTokens.TextLow,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+    }
+}
+
+/**
+ * R191「深度索引」图标钮（索引明细区旁）：未钉=描线 Storage（点=钉住+立即建库）；
+ * 在爬=小 spinner；完成=✓ 闪示（SuccessGreen）；已钉=填充 Storage（TgBlue=
+ * 已追胶囊同款"已建立"色语义；点=确认取消钉）。只触发回调，不选中频道不关窗——
+ * 触点 32dp 与相邻控件同密度。
+ */
+@Composable
+private fun ChannelDeepIndexButton(
+    manualState: dev.tgfeed.core.feed.ManualIndexRowState?,
+    onClick: () -> Unit,
+) {
+    Box(
+        Modifier
+            .size(32.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        when {
+            manualState?.building == true -> CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                color = TgFeedTokens.TgBlue,
+                strokeWidth = 2.dp,
+            )
+            manualState != null && dev.tgfeed.core.feed.manualRowShowCheck(manualState) -> Icon(
+                Icons.Filled.Check,
+                contentDescription = "深度索引完成",
+                tint = TgFeedTokens.SuccessGreen,
+                modifier = Modifier.size(18.dp),
+            )
+            manualState?.pinned == true -> Icon(
+                Icons.Filled.Storage,
+                contentDescription = "深度索引已钉住，点按取消",
+                tint = TgFeedTokens.TgBlue,
+                modifier = Modifier.size(18.dp),
+            )
+            else -> Icon(
+                Icons.Outlined.Storage,
+                contentDescription = "深度索引",
+                tint = TgFeedTokens.TextLow,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+    }
+}
+
+/** 相似文字钮（替代 ✨ 图标）：只触发回调，不选中频道不关窗 */
+@Composable
+private fun ChannelSimilarButton(onClick: () -> Unit) {
+    Text(
+        "相似",
+        color = TgFeedTokens.TextLow,
+        style = MaterialTheme.typography.labelMedium,
+        modifier = Modifier
+            .clip(RoundedCornerShape(TgFeedTokens.RadiusPill))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+    )
+}
+
+/**
+ * 追/已追文字胶囊（替代铃铛图标）：未追 SurfaceHigh 底，已追电报蓝浅底蓝字；
+ * 已追态点击先弹确认再退追（确认弹窗在 [ChannelCard] 宿主层）。
+ */
+@Composable
+private fun ChannelFollowPill(subscribed: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(TgFeedTokens.RadiusPill))
+            .background(
+                if (subscribed) TgFeedTokens.TgBlue.copy(alpha = 0.22f)
+                else TgFeedTokens.SurfaceHigh,
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        Text(
+            if (subscribed) "已追" else "追",
+            color = if (subscribed) TgFeedTokens.TgBlue else TgFeedTokens.TextHigh,
+            style = MaterialTheme.typography.labelMedium,
+        )
     }
 }

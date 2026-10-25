@@ -1,17 +1,12 @@
 package dev.tgfeed.ui.components.kit
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutLinearInEasing
 import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.SpringSpec
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -55,7 +50,9 @@ import dev.tgfeed.ui.SheetMaxWidth
 import dev.tgfeed.ui.theme.MotionTokens
 import dev.tgfeed.ui.theme.TgFeedTokens
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 /** 拖拽关窗阈值：面板被拖离落座的行程占比超过它即判意图为关窗（回座与关窗的分界） */
 private const val SHEET_DRAG_DISMISS_FRACTION = 0.25f
@@ -65,6 +62,19 @@ private val SheetStaggerSlide = 8.dp
 
 /** 抽屉左缘抓取条宽：整高可横向拖拽关窗的「左缘」热区（窄条不叠内容，零手势冲突） */
 private val DrawerEdgeStrip = 24.dp
+
+/**
+ * R396 抽屉宽屏占比（单源）：抽屉宽 = 屏宽 × 此分（再受 [DrawerMaxWidth] 帽约束）。
+ * **想调抽屉宽窄，改这一个数即可**（0.45 = 用户实锤「占屏约 3/5 太大」后的收窄定档；
+ * 0.92 旧档即用户嫌大的那版）。全 App 抽屉形态共用此口径，底部 sheet 宽度口径不变。
+ */
+internal const val DrawerWidthFraction = 0.45f
+
+/**
+ * R396 抽屉宽度上限（平板不过宽：巨屏 × 0.45 仍会铺出可读宽之外的巨抽屉，420dp 封顶）。
+ * 与 SheetMaxWidth（560dp，底部 sheet 巨屏口径）互不干涉——抽屉独立帽。
+ */
+private val DrawerMaxWidth = 420.dp
 
 /**
  * 面板锚定形态（R173 裁决：**按触发点就近锚定**——触发点在顶栏（☰ 汉堡）→ 左抽屉；
@@ -98,7 +108,8 @@ internal interface SheetDismissApi {
  * - scrim 收编 R162 token OverlayBg：进场 tween 180ms（先快后慢）、退场 150ms（利落）；
  * - 段落 stagger：内容侧 [SheetStaggeredSection]（0/+40/+80ms 三段），退场无 stagger；
  * - 底部形态高度上限 [MotionTokens.SheetMaxViewportFraction]（65vh）；抽屉形态全高、
- *   宽度 min(92% 屏宽, SheetMaxWidth)、内容让开状态栏；
+ *   宽度 min(45% 屏宽, 420dp)（R396 比例化收窄——调宽窄改 [DrawerWidthFraction]
+ *   一个数即可）、内容让开状态栏；
  * - 关窗手势：底部形态 = 头部抓取区（拖拽条+标题行）下拉；抽屉形态 = 头部抓取区 +
  *   左缘整高抓取条横拖。**朝锚定边方向**拖过阈值即关窗（拖拽释放后续接同一枚 spring
  *   从当前位置滑出——手势延续，不走第二段动画），未过阈值 spring 回座。
@@ -125,8 +136,22 @@ internal fun AppSheetMotion(
     val panelOffset = remember { Animatable(1f) }
     // scrim 透明度：与面板 spring 各走各的时长曲线（180 进/150 退，先快后慢/先慢后快）
     val scrimAlpha = remember { Animatable(0f) }
-    // 面板沿滑入轴的实测长度 px（底部=高，抽屉=宽）；测得之前先把面板顶出屏外（防首帧闪现）
-    var panelSpanPx by remember { mutableStateOf(0) }
+    // 面板沿滑入轴的长度 px（底部=高，抽屉=宽）。R396：抽屉形态的组合期即可直算
+    // 初值（宽 = min(45% 屏宽, 420dp)）——首帧位移基准即正确，「测得之前顶出屏外」
+    // （防首帧闪现）退居兜底；底部 sheet 高度不可预知，仍以 0 起等 onSizeChanged 实测
+    // （旋转等配置变化由 onSizeChanged 实测校准兜底，remember 键不含配置）
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    var panelSpanPx by remember {
+        mutableStateOf(
+            if (anchor == SheetAnchor.LEFT) {
+                // Float.roundToPx 不存在（roundToPx 只收 Dp/TextUnit）——dp 值域直接
+                // roundToInt；与 fillMaxWidth(fraction) 布局舍入差 ≤1px，onSizeChanged 实测兜底
+                minOf(screenWidthDp * DrawerWidthFraction, DrawerMaxWidth.value).roundToInt()
+            } else {
+                0
+            },
+        )
+    }
     // 退场中标记：动画已在播，后续关窗请求一律吞掉（防双动画/双回调）
     var dismissing by remember { mutableStateOf(false) }
     val sheetSpring = spring<Float>(
@@ -290,8 +315,9 @@ private fun BoxScope.BottomPanel(
 
 /**
  * 左侧抽屉面板（[SheetAnchor.LEFT]，R173 裁决：☰ 触发点在顶栏左缘 → 抽屉就近锚定）：
- * 全高、宽 min(92% 屏宽, SheetMaxWidth)、右缘圆角、内容让开状态栏；左缘整高抓取条 +
- * 头部抓取区横拖关窗（朝锚定边=向左拖过阈值关窗，Material 抽屉标准语义）。
+ * 全高、宽 min(45% 屏宽, 420dp)（R396 比例化收窄，[DrawerWidthFraction] 单源可调）、
+ * 右缘圆角、内容让开状态栏；左缘整高抓取条 + 头部抓取区横拖关窗
+ * （朝锚定边=向左拖过阈值关窗，Material 抽屉标准语义）。
  */
 @Composable
 private fun BoxScope.DrawerPanel(
@@ -338,8 +364,8 @@ private fun BoxScope.DrawerPanel(
         Modifier
             .align(Alignment.CenterStart)
             .fillMaxHeight()
-            .fillMaxWidth(0.92f)
-            .widthIn(max = SheetMaxWidth)
+            .fillMaxWidth(DrawerWidthFraction)
+            .widthIn(max = DrawerMaxWidth)
             .graphicsLayer {
                 translationX = if (panelSpanPx > 0) -panelOffset.value * panelSpanPx else -10_000f
             }
@@ -383,22 +409,38 @@ private fun BoxScope.DrawerPanel(
 /**
  * sheet 段落进场（design-proposal §4.3 stagger）：三段 t=0/+40/+80ms，每段
  * fadeIn(AnimFast=150ms) + 8dp 位移(AnimMed=220ms)；段内整行同拍登场，不逐 chip。
- * 退场无 stagger（ExitTransition.None）——内容跟随面板整体滑出，「退场要利落」。
+ * 退场无 stagger——内容跟随面板整体滑出，「退场要利落」。
  *
- * 实现注记：MutableTransitionState(false→true) 的一次性进场模式（官方用法），
- * 面板每次挂载（每次开窗会话）都会重播各自的 stagger。
+ * **R396 丝滑化（绘制相位重写）**：旧实现 AnimatedVisibility(offset 位移动画)+
+ * MutableTransitionState——段落延迟组合 + 每帧 layout，把组合/布局波澜带进面板
+ * spring 动画窗（抽屉源面板实测掉帧主源之一）。本版改 Animatable×2 + graphicsLayer：
+ * - 内容**首帧即组合**（组合成本发生在 spring 起点面板尚在屏外时，不再撞进
+ *   滑入中段最显眼处）；alpha/translationY 只动**绘制相位**——动画窗内零逐帧
+ *   重组、零逐帧 layout；
+ * - 观感参数逐字保留（AnimFast 150ms 淡入 / AnimMed 220ms 位移 /
+ *   FastOutSlowInEasing / 40ms 步进由调用方 [MotionTokens.SheetStaggerStepMs] 排布）；
+ * - 每次挂载（每次开窗会话）都会重播各自的 stagger（LaunchedEffect(Unit) 起播）。
  */
 @Composable
 internal fun SheetStaggeredSection(delayMs: Int, content: @Composable () -> Unit) {
-    val visibleState = remember { MutableTransitionState(false).apply { targetState = true } }
+    val alphaProgress = remember { Animatable(0f) }
+    val slideProgress = remember { Animatable(0f) }
     val slidePx = with(LocalDensity.current) { SheetStaggerSlide.roundToPx() }
-    AnimatedVisibility(
-        visibleState = visibleState,
-        enter = fadeIn(tween(TgFeedTokens.AnimFast, delayMillis = delayMs)) +
-            slideInVertically(
-                tween(TgFeedTokens.AnimMed, delayMillis = delayMs, easing = FastOutSlowInEasing),
-            ) { slidePx },
-        exit = ExitTransition.None,
+    // 面板每次挂载（每次开窗会话）都会重播各自的 stagger；段间步进由调用方排布
+    LaunchedEffect(Unit) {
+        if (delayMs > 0) delay(delayMs.toLong())
+        launch {
+            alphaProgress.animateTo(1f, tween(TgFeedTokens.AnimFast, easing = FastOutSlowInEasing))
+        }
+        slideProgress.animateTo(1f, tween(TgFeedTokens.AnimMed, easing = FastOutSlowInEasing))
+    }
+    // alpha/位移只进 graphicsLayer 块（绘制相位读值，重绘不重组不重排）——
+    // R396 动画窗内零逐帧组合/布局纪律
+    Box(
+        Modifier.graphicsLayer {
+            alpha = alphaProgress.value
+            translationY = (1f - slideProgress.value) * slidePx
+        },
     ) {
         content()
     }

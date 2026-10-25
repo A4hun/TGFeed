@@ -48,6 +48,7 @@ import androidx.compose.material.icons.outlined.FileUpload
 import androidx.compose.material.icons.outlined.Groups
 import androidx.compose.material.icons.outlined.HelpOutline
 import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.ManageSearch
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.NotInterested
@@ -93,6 +94,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -100,6 +102,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.tgfeed.BuildConfig
+import dev.tgfeed.R
 import dev.tgfeed.core.feed.FeedViewModel
 import dev.tgfeed.core.backup.BackupManager
 import dev.tgfeed.core.feed.DemandSubscription
@@ -169,6 +172,8 @@ fun SettingsScreen(
     onOpenDownloads: () -> Unit = {},
     // 打开"观看报告"页（路由由容器层接）；默认空实现保证旧调用点不用改
     onOpenWatchReport: () -> Unit = {},
+    // 打开"关于"页（路由由容器层接）；默认空实现保证旧调用点不用改
+    onOpenAbout: () -> Unit = {},
     // 生效中的凭证（含编译期 BuildConfig 兜底），用于字段预填——只读 prefs 会把凭证显示成空白
     effectiveApiId: Int = 0,
     effectiveApiHash: String = "",
@@ -1962,6 +1967,26 @@ fun SettingsScreen(
                         }
                     }
                 }
+            }
+
+            // ---------------- 关于（版本信息 / 开源许可 / 项目主页；业界惯例置底） ----------------
+            // 版本行直达关于页：版本号与构建变体实读 BuildConfig（版本名+内部版本号+变体如实），
+            // 点行进入关于页看版本详情、检查更新、开源许可与免责要点
+            SettingsCard("关于") {
+                SettingsActionRow(
+                    icon = Icons.Outlined.Info,
+                    title = "${stringResource(R.string.app_name)} v${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE})",
+                    subtitle = "构建变体 ${BuildConfig.BUILD_TYPE} · 版本详情、开源许可与项目主页",
+                    trailing = {
+                        Icon(
+                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = null,
+                            tint = TgFeedTokens.TextLow,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    },
+                    onClick = onOpenAbout,
+                )
             }
 
             // ---------------- 危险区：本地数据管理（不可恢复操作） ----------------

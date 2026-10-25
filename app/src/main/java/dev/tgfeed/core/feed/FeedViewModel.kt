@@ -223,8 +223,23 @@ class FeedViewModel(
             // 不过滤则每次冷启动首屏必重播旧片。整页皆已看 = 等同无快照，交给首拉
             val (snapSeenK, snapSeenU) = runCatching { store.loadSeenIdentities() }
                 .getOrDefault(emptySet<String>() to emptySet())
+            // R390 冷启主快照同口径（与 R170b 关注流快照垫底同一病类——发现一个修
+            // 一类）：类型/筛选对齐谓词补齐。冷启时 _mediaTypeTab/_filter 为默认值
+            // （全部 tab/无筛选），设置页类型开关持久生效（关「图片」后冷启快照
+            // 不再冒图）；屏蔽/不感兴趣集合由 init 各预载协程供给，与快照协程并发
+            // 时按当时在场值放行（维度与修前一致，如实记——本刀主疗效=类型过滤，
+            // 确定性来自 prefs 持久层与 tab 状态）。
+            val typePrefsR390 = dev.tgfeed.core.prefs.AppPrefs(app)
             val snapFresh = snap.items.filter {
-                it.key !in snapSeenK && (it.fileUniqueId.isEmpty() || it.fileUniqueId !in snapSeenU)
+                it.key !in snapSeenK && (it.fileUniqueId.isEmpty() || it.fileUniqueId !in snapSeenU) &&
+                    SnapshotReplayPolicy.typeAligned(
+                        it,
+                        _mediaTypeTab.value,
+                        typePrefsR390.showVideos,
+                        typePrefsR390.showPhotos,
+                        typePrefsR390.showAudio,
+                        _filter.value,
+                    )
             }
             if (snapFresh.isEmpty()) {
                 dev.tgfeed.core.diag.ColdStartProbe.mark("首屏快照全为已看，跳过（${snap.items.size} 条滤净）")

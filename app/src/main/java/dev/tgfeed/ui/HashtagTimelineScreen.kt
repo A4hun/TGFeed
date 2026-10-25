@@ -30,6 +30,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ManageSearch
+import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Tag
@@ -37,6 +38,7 @@ import androidx.compose.material.icons.outlined.Timeline
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -109,6 +111,9 @@ import java.util.Locale
  * IO 复活（reviveDetachedItems）→ TimeWindowFeedSource 一次性源 → 轮询
  * requestFeedJump 定位 → 返回键先回本页（RoutePendingKind.HASHTAG_TIMELINE，
  * pending 置位在切源之后——r202 戳序竞态口径）。
+ * R397 批量入分屏（六入口之六·#话题标签页）：统计行下「分屏播放 N 条」文字钮——
+ * 过滤后整墙（wall，与播放批同源「墙显什么种什么」）种进分屏片单并直接开分屏
+ * （统一机制 App.addBatchToGrid；DB 条目 playUri=null 走格内 ensurePlayable 现拉）。
  */
 @Composable
 fun HashtagTimelineScreen(
@@ -116,6 +121,9 @@ fun HashtagTimelineScreen(
     tag: String,
     onBack: () -> Unit,
     onPlay: (batch: List<VideoItem>, label: String, target: VideoItem) -> Unit,
+    // R397 批量入分屏：宿主（MainActivity）收口——种进容器片单 + 剥落本页 + 开分屏；
+    // 钮文案实数=过滤后墙格数（wall.size），实增数/重复数由宿主 Toast 如实报账
+    onBatchToGrid: (List<VideoItem>) -> Unit = {},
 ) {
     val app = LocalContext.current.applicationContext as Application
     // 系统返回键 = 返回上一页（状态驱动路由，不在返回栈里，不拦会退到桌面）
@@ -170,6 +178,7 @@ fun HashtagTimelineScreen(
                 tag = tag,
                 result = s.result,
                 onPlay = onPlay,
+                onBatchToGrid = onBatchToGrid,
             )
         }
     }
@@ -195,6 +204,7 @@ private fun TimelineBody(
     tag: String,
     result: EventResearchResult,
     onPlay: (batch: List<VideoItem>, label: String, target: VideoItem) -> Unit,
+    onBatchToGrid: (List<VideoItem>) -> Unit,
 ) {
     val fmtDate = remember { SimpleDateFormat("yyyy-MM-dd", Locale.CHINA) }
     // 引擎输出已按时间升序：首=首次出现，末=最新
@@ -267,6 +277,22 @@ private fun TimelineBody(
                 .fillMaxWidth()
                 .padding(horizontal = TgFeedTokens.GapLg),
         )
+        // R397 批量入分屏：过滤后整墙种进分屏（墙显什么种什么——onPlay 播放批同源
+        // wall；频道 chips 过滤即时反映到钮实数与种子集）
+        if (wall.isNotEmpty()) {
+            TextButton(onClick = { onBatchToGrid(wall) }) {
+                Icon(
+                    Icons.Outlined.GridView,
+                    contentDescription = null,
+                    tint = TgFeedTokens.AccentRed,
+                )
+                Spacer(Modifier.width(TgFeedTokens.GapXs))
+                Text(
+                    "分屏播放 ${wall.size} 条",
+                    color = TgFeedTokens.AccentRed,
+                )
+            }
+        }
         // ---- 频道 chips（分组/过滤维度）----
         if (channelTotal > 1) {
             LazyRow(

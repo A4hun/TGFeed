@@ -12,12 +12,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -26,10 +28,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -82,12 +86,18 @@ import kotlinx.coroutines.withContext
  * - 取消收藏：格子右上角星形角标（40dp 热区/24dp 视觉，GridScreen 拖柄同口径），
  *   点按即 vm.toggleFavorite 取消 + Toast「已取消收藏」——列表即时减一格。
  * - 空态：诚实引导卡（「看视频时点右轨的星标」）。
+ * - R397 批量入分屏（六入口之二·收藏夹）：视图切换胶囊行下「分屏播放 N 条」文字钮
+ *   ——整批收藏（时间倒序原样）种进分屏片单并直接开分屏（统一机制 App.addBatchToGrid；
+ *   收藏条目 playUri=null 时入格走格内 ensurePlayable 现拉，离线可播口径不变）。
  */
 @Composable
 fun FavoritesScreen(
     gateway: TdGateway,
     onBack: () -> Unit,
     onPlay: (VideoItem) -> Unit,
+    // R397 批量入分屏：宿主（MainActivity）收口——种进容器片单 + 剥落本页 + 开分屏；
+    // 钮文案实数=本页 items.size，实增数/重复数由宿主 Toast 如实报账
+    onBatchToGrid: (List<VideoItem>) -> Unit = {},
 ) {
     val app = LocalContext.current.applicationContext as Application
     val context = LocalContext.current
@@ -150,6 +160,27 @@ fun FavoritesScreen(
                         selected = groupByChannel,
                         onClick = { groupByChannel = true },
                     )
+                }
+                // R397 批量入分屏：整批收藏倒进分屏（钮文案实数；分组视图下同批全量——
+                // 种子集=数据层条目表，与视图分组无关，所见条目一条不少）
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = TgFeedTokens.GapLg),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = { onBatchToGrid(items) }) {
+                        Icon(
+                            Icons.Outlined.GridView,
+                            contentDescription = null,
+                            tint = TgFeedTokens.AccentRed,
+                        )
+                        Spacer(Modifier.width(TgFeedTokens.GapXs))
+                        Text(
+                            "分屏播放 ${items.size} 条",
+                            color = TgFeedTokens.AccentRed,
+                        )
+                    }
                 }
             }
 

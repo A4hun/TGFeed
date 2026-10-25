@@ -64,6 +64,7 @@ import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Clear
 import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.Collections
+import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Inbox
 import androidx.compose.material.icons.outlined.Search
@@ -178,7 +179,10 @@ import kotlinx.coroutines.withTimeoutOrNull
  *  4. Tab 行：作品（默认，带数量角标）/ 合集（频道有图集才出现，按 albumId 归组，
  *     一格一合集，角标"🖼 图集 ×N"）；作品 tab 下挂类型筛选小 tab
  *     （全部/视频/图文/音频，下划线式，与 Feed/搜索页同一语言，只出现该频道
- *     实际有的类型，单一类型不显示）。
+ *     实际有的类型，单一类型不显示）。R397 批量入分屏（六入口之三·频道主页
+ *     媒体墙）：Tab 块尾部「分屏播放 N 条」文字钮——吃当前 tab 口径（作品=类型
+ *     筛选+剧集链聚合后的散格；合集=图集代表格；搜索模式 tab 口径不存在故不出现），
+ *     墙显什么种什么，种进分屏片单并直接开分屏（统一机制 App.addBatchToGrid）。
  *  5. 作品网格：3 列封面墙，格子圆角 RadiusSm、封面 ContentScale.Crop，
  *     带类型角标 + 时长（视频）；空态 AppEmptyState，加载态 AppLoading。
  *
@@ -214,6 +218,9 @@ fun ChannelHomeScreen(
     brief: ChannelBrief,
     onBack: () -> Unit,
     onOpenItem: (VideoItem) -> Unit,
+    // R397 批量入分屏：宿主（MainActivity）收口——种进容器片单 + 剥落本覆盖层 +
+    // 开分屏；钮文案实数=当前 tab 墙格数（gridItems），实增数/重复数由宿主如实报账
+    onBatchToGrid: (List<VideoItem>) -> Unit = {},
 ) {
     BackHandler(onBack = onBack)
 
@@ -1257,6 +1264,26 @@ fun ChannelHomeScreen(
                                         onClick = { typeFilter = type },
                                     )
                                 }
+                            }
+                        }
+                        // R397 批量入分屏：Tab 块尾部文字钮——吃当前 tab 口径（作品=类型
+                        // 筛选+剧集链聚合后散格；合集=图集代表格），gridItems 即墙所显
+                        // （墙显什么种什么）；空墙不出现（无内容可种=诚实缺席）
+                        if (gridItems.isNotEmpty()) {
+                            TextButton(
+                                onClick = { onBatchToGrid(gridItems) },
+                                modifier = Modifier.padding(start = 16.dp, top = 2.dp),
+                            ) {
+                                Icon(
+                                    Icons.Outlined.GridView,
+                                    contentDescription = null,
+                                    tint = TgFeedTokens.AccentRed,
+                                )
+                                Spacer(Modifier.width(TgFeedTokens.GapXs))
+                                Text(
+                                    "分屏播放 ${gridItems.size} 条",
+                                    color = TgFeedTokens.AccentRed,
+                                )
                             }
                         }
                         // Tab 块底部分隔发丝线：网格内容从其下滚过时勾出边界

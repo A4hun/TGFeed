@@ -325,6 +325,17 @@ class AppContainer(private val context: Application) {
     fun openWatchReport() { _showWatchReport.value = true }
     fun closeWatchReport() { _showWatchReport.value = false }
 
+    /**
+     * 关于页显隐(入口:设置页底部「关于」区版本行)。开页不关设置(与
+     * openDownloads/openWatchReport 同口径——设置垫底下,关于返回剥落回设置);
+     * 层级正确性由 MainActivity when 链分支序保证(关于分支在 showSettings 之前)。
+     */
+    private val _showAbout = MutableStateFlow(false)
+    val showAbout: StateFlow<Boolean> = _showAbout
+
+    fun openAbout() { _showAbout.value = true }
+    fun closeAbout() { _showAbout.value = false }
+
     /** 频道体检页显隐（R132 僵尸/变质频道一键断舍离；入口：我的页"频道体检"行） */
     private val _showChannelHealth = MutableStateFlow(false)
     val showChannelHealth: StateFlow<Boolean> = _showChannelHealth
@@ -861,6 +872,28 @@ class AppContainer(private val context: Application) {
 
     fun addToGrid(item: VideoItem) {
         if (gridPlaylist.none { it.key == item.key }) gridPlaylist.add(item)
+    }
+
+    /**
+     * R397 批量入分屏统一口（「批量入分屏」VM 入口——分屏片单持有者=本容器，
+     * 与 [addToGrid] 同居同权）：任意 List<VideoItem> 一次种进分屏片单。
+     *
+     * 去重 = [dev.tgfeed.core.feed.gridBatchSeedAppend]（单条路 key 判轨批量化：
+     * 片单既撞剔除 + 批内同 key 首保，序保持）；返回**实增数**（调用方如实
+     * Toast/口径，重复批零编造）。探针计数行（脱敏铁律：来源标签=面名，零内容）。
+     *
+     * 接入判词：任何新列表面 = 钮回调传 List<VideoItem> → 本口一行 +
+     * 剥落子页 + [showGrid]（既有入口链）。channel 形态面先
+     * [dev.tgfeed.core.feed.fetchCollectionSeed] 换成条目集再走同一条。
+     * 主线程口径：gridPlaylist 是 Compose 快照态（快照写须主线程——本口由
+     * UI 钮回调调用天然满足，与 addToGrid 同纪律）。
+     */
+    fun addBatchToGrid(source: String, items: List<VideoItem>): Int {
+        val append = dev.tgfeed.core.feed.gridBatchSeedAppend(gridPlaylist, items)
+        if (append.isNotEmpty()) gridPlaylist.addAll(append)
+        // 探针：计数行零内容（来源=面名/条数=实增数；与「从片单添加」Toast 同款信息位）
+        android.util.Log.i("TGFlow", "R397 批量入分屏:来源=$source 条数=${append.size}")
+        return append.size
     }
 
     fun removeFromGrid(item: VideoItem) {

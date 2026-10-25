@@ -573,6 +573,30 @@ class MainActivity : ComponentActivity() {
         android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
     }
 
+    /**
+     * R397 批量入分屏·宿主收口单口（六入口共用）：种进容器片单（统一机制
+     * App.addBatchToGrid，去重+探针计数行在容器内）→ 如实报账 Toast → 开分屏
+     * （既有入口链 container.showGrid；调用方先剥落自己的子页/覆盖层——宿主 when
+     * 链子页分支先于 grid 分支，不剥落会被压住）。
+     * 报账口径：实增 0=「都已在分屏」；部分重复=实增数+跳过数都报；探针行
+     * （R397 批量入分屏:来源=source 条数=N）零内容脱敏在容器侧。
+     */
+    private fun seedGridAndOpen(
+        source: String,
+        items: List<dev.tgfeed.core.td.VideoItem>,
+    ) {
+        if (items.isEmpty()) return // 空批守卫：入口面已按非空显钮，这里兜底零动作
+        val added = container.addBatchToGrid(source, items)
+        toast(
+            when {
+                added == 0 -> "这批都已在分屏片单里"
+                added < items.size -> "已加入分屏 $added 条（重复 ${items.size - added} 条已跳过）"
+                else -> "已加入分屏 $added 条"
+            },
+        )
+        container.showGrid()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         dev.tgfeed.core.diag.ColdStartProbe.mark("MainActivity.onCreate") // R52 冷启动打点
@@ -613,6 +637,7 @@ class MainActivity : ComponentActivity() {
                 val showSettings by container.showSettings.collectAsState()
                 val showDownloads by container.showDownloads.collectAsState()
                 val showWatchReport by container.showWatchReport.collectAsState()
+                val showAbout by container.showAbout.collectAsState()
                 val showChannelHealth by container.showChannelHealth.collectAsState()
                 val showTasteMap by container.showTasteMap.collectAsState()
                 // R205 事件研究器页（发现页深功能区进；与口味星图同级的状态驱动路由）
@@ -675,7 +700,7 @@ class MainActivity : ComponentActivity() {
                         topLevelPage = container.topLevelPage.value,
                     ),
                 )
-                val overlayPageOpen = showSettings || showDownloads || showWatchReport ||
+                val overlayPageOpen = showSettings || showAbout || showDownloads || showWatchReport ||
                     showChannelHealth || showTasteMap || showWatchHistory || showPlaylists ||
                     showSearch || showFavorites || showEventResearch || showOnThisDay ||
                     showTimeMachine || showHashtagTimeline || channelHome != null
@@ -1406,6 +1431,12 @@ class MainActivity : ComponentActivity() {
                     dev.tgfeed.ui.components.kit.LocalBottomBarInset provides barInset,
                 ) {
                 when {
+                    // 关于页(设置页「关于」区进入;纯静态内容零网络。分支排在
+                    // showSettings 之前=覆盖页先于宿主匹配的层级不变式,同
+                    // showWatchReport;返回剥落回设置)
+                    showAbout -> dev.tgfeed.ui.AboutScreen(
+                        onBack = { container.closeAbout() },
+                    )
                     // 观看报告页
                     showWatchReport -> dev.tgfeed.ui.WatchReportScreen(
                         gateway = gateway,
@@ -1532,6 +1563,13 @@ class MainActivity : ComponentActivity() {
                             container.favoritesReturnStamp = dev.tgfeed.core.feed.BackNavClock.next()
                             container.closeMine() // R177：落点=首页页位（同快照合并，showFeed 裁定）
                             container.showFeed()
+                        },
+                        // R397 批量入分屏（入口②·收藏夹）：整批收藏倒进分屏——收藏页
+                        // 从我的页进，剥落链与 onPlay 同款（收藏页+我的页让路）
+                        onBatchToGrid = { items ->
+                            container.closeFavorites()
+                            container.closeMine()
+                            seedGridAndOpen("收藏", items)
                         },
                     )
                     // R203 那年今日页（TL-2）：年轮 pills + 任意日期回看 + 精选策展列表；
@@ -1753,6 +1791,14 @@ class MainActivity : ComponentActivity() {
                             container.closeMine()
                             container.showFeed()
                         },
+                        // R397 批量入分屏（入口⑥·#话题标签页）：过滤后整墙种进分屏——
+                        // 剥落链与 onPlay 同款（话题页/发现页/我的页让路）
+                        onBatchToGrid = { items ->
+                            container.closeHashtagTimeline()
+                            container.closeDiscover()
+                            container.closeMine()
+                            seedGridAndOpen("话题", items)
+                        },
                     )
                     // M1 全量搜索页（已加入频道 100% 覆盖；优先级与发现页同级，压在 pager 之上）
                     showSearch -> dev.tgfeed.ui.SearchScreen(
@@ -1857,6 +1903,14 @@ class MainActivity : ComponentActivity() {
                             container.closeDiscover()
                             container.closeMine()
                             container.showFeed()
+                        },
+                        // R397 批量入分屏（入口①·搜索结果页）：当前所见整批种进分屏并
+                        // 直接开格——剥落链与 onPlay 同款（搜索页/发现页/我的页都让路）
+                        onBatchToGrid = { items ->
+                            container.closeSearch()
+                            container.closeDiscover()
+                            container.closeMine()
+                            seedGridAndOpen("搜索", items)
                         },
                     )
                     // 下载管理页
@@ -1992,6 +2046,7 @@ class MainActivity : ComponentActivity() {
                         effectiveApiHash = container.displayApiHash,
                         onOpenDownloads = { container.openDownloads() },
                         onOpenWatchReport = { container.openWatchReport() },
+                        onOpenAbout = { container.openAbout() },
                     )
                     }
                     // 口味星图页（R143：DiscoveryGraph 互链图谱+观看行为渲染的可交互星系图；
@@ -2342,6 +2397,14 @@ class MainActivity : ComponentActivity() {
                             container.channelHomeReturnStamp = dev.tgfeed.core.feed.BackNavClock.next()
                             container.closeChannelHome()
                             container.showFeed()
+                        },
+                        // R397 批量入分屏（入口③·频道主页媒体墙）：当前 tab 口径整墙
+                        // （作品=类型筛选+剧集链聚合散格/合集=图集代表格）种进分屏——
+                        // 剥落链与 onOpenItem 同款（频道主页覆盖层让路；grid 分支在 when
+                        // 链 feed 分支内，压在其上的覆盖层须先关）
+                        onBatchToGrid = { items ->
+                            container.closeChannelHome()
+                            seedGridAndOpen("频道主页", items)
                         },
                     )
                 }
