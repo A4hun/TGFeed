@@ -68,6 +68,13 @@ object TasteLodPolicy {
     const val LOWMESH_MAX_DP = 4.0f
 
     /**
+     * R399 微点直径地板下限（**裸像素**）：与尘埃档 [DUST 最小点]（TasteTagPlanets
+     * 私有 DUST_R_MIN_PX=1.1 半径=2.2 直径，「远档也可见的最小点」）同拍的保底
+     * ——dp 线在小密度屏塌缩时由它兜住「最小可见」（见 [microDotPx]）。
+     */
+    const val MICRO_DOT_MIN_PX = 2.2f
+
+    /**
      * 密度换算单口（R355——**全帧唯一一处乘 density**）：Android
      * displayMetrics.density 真值域 ldpi(0.75)~xxhdpi+(3.5) 防呆钳 [0.75,4.0]
      * （域外/缺省收敛 mdpi 侧——密度缺失时阈值不塌零）。
@@ -81,6 +88,15 @@ object TasteLodPolicy {
      * 点档上限：形态线换轨+数量线正交，r341 §0）。
      */
     fun pointCeilPx(density: Float): Float = POINT_CEIL_DP * densityScale(density)
+
+    /**
+     * R399 行星微点直径地板（px）：`max([MICRO_DOT_MIN_PX], [pointCeilPx])`——
+     * 「最小可见亮点」的形态线口径（1.2dp=肉眼刚分辨圆盘的半径阈复用为微点直径；
+     * 低密度屏由裸像素下限兜底=与微星/尘埃点同族语言）。消费=行星 count 轴微点腿
+     * （GlFrameBuilder 帧字段 [lodMicroDotPx]——build 首算）+ buildPlanetBody 点腿
+     * 尺寸地板（亚像素行星不蒸发）。判词引 r399_notes §2。
+     */
+    fun microDotPx(density: Float): Float = maxOf(MICRO_DOT_MIN_PX, pointCeilPx(density))
 
     /**
      * effective solid floor（回退序①——r341 §4.3）：bias≥1 阈值上抬

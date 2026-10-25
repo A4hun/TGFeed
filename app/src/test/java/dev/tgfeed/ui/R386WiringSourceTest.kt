@@ -19,9 +19,9 @@ import java.io.File
  *    放行位，R355WiringSourceTest 已扩锚）；同 dp 同路由=跨密度形态一致；mdpi
  *    恒等档 150px 数值原样=设计基线路由零变化；
  *  - 丝缕基因保留锚：远档裁剪**只裁层数**（blobCount=1，配比包随裁后层数归一
- *    ——单层=FRONT 配比语义）——种子相拉/NEBULA_FS 文本/fbm3 octave/ridge 脊线/
- *    暗尘带零接触（R358 uniform 四件锚不破：uColor/uAlpha/uSeed/uTime 仍四件，
- *    GlShaders 本批零改）。
+ *    ——单层=FRONT 配比语义）——种子相拉/ridge 脊线/暗尘带零接触（R392 判词①
+ *    翻新：NEBULA_FS 噪声载体=烘焙 3D 纹理 fieldAt 采样，uniform 六件=五浮点
+ *    +uNoiseVol sampler 载体件——构造基因字面全保）。
  */
 class R386WiringSourceTest {
 
@@ -82,8 +82,9 @@ class R386WiringSourceTest {
 
     /**
      * ② dp 换算在场锚：build 帧首单口直乘 `cpxFarMinPx = CPX_FAR_MIN_DP *
-     * lodDensity`（R355 三连同块第四条——帧字段初值=mdpi 恒等档；全文件
-     * lodDensity 直乘恰此一条）。
+     * lodDensity`（R355 三连同块第四条——帧字段初值=mdpi 恒等档；R388 翻新：
+     * 全文件 lodDensity 直乘=帧首 dp 阈族四条——R386 一条+刀1 隐没带两条+刀2
+     * REF 一条）。
      */
     @Test
     fun dp换算_帧首单口直乘与mdpi恒等档() {
@@ -97,8 +98,8 @@ class R386WiringSourceTest {
             Regex("private var cpxFarMinPx = CPX_FAR_MIN_DP").containsMatchIn(b),
         )
         assertEquals(
-            "lodDensity 直乘全文件恰一条（帧首 R386 位——别处零乘法，R355 单口纪律不破）",
-            1,
+            "lodDensity 直乘全文件恰四条（帧首 dp 阈族：R386 一条+R388 刀1 隐没带两条+刀2 REF 一条——别处零乘法，R355 单口纪律不破）",
+            4,
             Regex("\\*\\s*lodDensity").findAll(b).count(),
         )
     }
@@ -106,8 +107,10 @@ class R386WiringSourceTest {
     /**
      * ③ 丝缕基因保留锚：远档只裁层数——clip 体恰 `blobCount = 1` 一行（种子/
      * 半径/配比零改）；配比包装填在裁剪后（随裁后层数归一=单层 FRONT 语义）；
-     * NEBULA_FS 丝缕基因三件原样在场（ridge 脊线/暗尘带/丝间留空门）+uniform
-     * 仍四件（R358 锚不破——GlShaders 本批零改）。
+     * NEBULA_FS 丝缕基因在场（ridge 脊线/暗尘带/丝间留空门）+uniform 五件
+     * （R388 翻新保义：四件→五件=刀2 uFreqScale 维护性扩展——「丝缕基因的
+     * 尺度变换非基因改变」，scale=1 恒等既有基因；丝间留空门=gateLo 标度态
+     * 字面，scale=1 位移零=0.40 原值恒等）。
      */
     @Test
     fun 丝缕基因保留_只裁层数零碰shader基因() {
@@ -126,15 +129,24 @@ class R386WiringSourceTest {
         )
         // 种子相拉路径原样（k 层相拉——clip 不改种子基因）
         assertTrue("种子相拉原样（seed + k * 13.7f）", cpx.contains("seed + k * 13.7f"))
-        // NEBULA_FS 丝缕基因三件 + uniform 四件（R358 锚——GlShaders 零改旁证）
+        // NEBULA_FS 丝缕基因 + uniform 六件（R388 翻新：第五件 uFreqScale=刀2
+        // 频率标度维护性扩展——默认 1.0 既有基因恒等，判词保义；R392 判词①翻新：
+        // 第六件 uNoiseVol sampler=烘焙 3D 噪声体——载体件非参数件；ridge 构造
+        // 基因字面原样，载体=fieldAt 采样）
         val fs = nebulaFsOf(glShaders())
-        assertTrue("ridge 脊线原样（丝缕基因①）", fs.contains("float ridge = 1.0 - abs(2.0 * fbm3(q * 2.3 + warp * 1.1) - 1.0);"))
+        assertTrue("ridge 脊线原样（丝缕基因①——R392 载体=fieldAt 烘焙体采样）", fs.contains("float ridge = 1.0 - abs(2.0 * fieldAt(q * 2.3 + warp * 1.1) - 1.0);"))
         assertTrue("暗尘带减法剪影原样（丝缕基因③）", fs.contains("a *= 1.0 - 0.55 * lane;"))
-        assertTrue("丝间留空门原样（smoothstep 0.40-0.82 alpha 门）", fs.contains("smoothstep(0.40, 0.82, d2)"))
-        val uniforms = Regex("uniform (?:float|vec[23]) (u\\w+);").findAll(fs).toList().map { it.groupValues[1] }
+        assertTrue(
+            "丝间留空门=gateLo 标度态（R388 稀疏化：scale=1 位移零=0.40 原值恒等——门基因保义）",
+            fs.contains("float gateLo = 0.40 + 0.24 * (1.0 - uFreqScale);") &&
+                fs.contains("float a = smoothstep(gateLo, 0.82, d2) * fall * uAlpha;"),
+        )
+        // 枚举含精度限定与 sampler（R392：uSeed/uTime 显式 highp 件+uNoiseVol
+        // mediump sampler3D 第六件——regex 须吃精度前缀否则静默漏件）
+        val uniforms = Regex("uniform (?:highp |mediump )?(?:float|vec[23]|sampler3D) (u\\w+);").findAll(fs).toList().map { it.groupValues[1] }
         assertEquals(
-            "NEBULA_FS uniform 仍四件（uColor/uAlpha/uSeed/uTime——R358 锚不破）",
-            listOf("uColor", "uAlpha", "uSeed", "uTime"),
+            "NEBULA_FS uniform 六件（五浮点+uNoiseVol sampler 第六件——R392 判词①载体件）",
+            listOf("uColor", "uAlpha", "uSeed", "uTime", "uFreqScale", "uNoiseVol"),
             uniforms,
         )
     }

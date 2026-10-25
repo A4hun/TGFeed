@@ -423,6 +423,29 @@ object TasteTagPlanets {
         ((APPEAR_RATIO - ratio) / (APPEAR_RATIO - FULL_RATIO)).coerceIn(0f, 1f)
 
     /**
+     * R399 count 轴微点权重（0..1）：行星「未浮现」态（[appearAlpha]<1 或系统
+     * 越过 [APPEAR_RATIO]）的**行星色微点**淡入权重——「优雅降级而非消失」判词
+     * （r399_notes §2）的单源公式：
+     *  - **域内（ratio<[APPEAR_RATIO]）**：`=1−[appearAlpha]`——球淡出的镜像
+     *    （点×(1−a)+球×a 双态叠加=R349 blend 带同族语言，count 轴交接零跳变：
+     *    近距 a=1→微点 0 让位球身；淡出途中点升球降；a=0→纯微点）；
+     *  - **域外（ratio≥[APPEAR_RATIO]，未浮现档）**：top [LOD_MID_PLANETS] 颗满额
+     *    （远档微点=中距 top 集同拍——**点预算帽**：全场系统×K 有界，超 8192
+     *    点帽风险不入场）；深位（index≥K）在 APPEAR 后一个 [ramp] 坡道窗内
+     *    1→0 退场（域内深位微点=1 的连续收口=门边界零跳变；窗外全零）。
+     * [ramp] 与 [appearAlpha] 同参（成型态放缓窗同拍）。
+     */
+    fun microDotAlpha01(ratio: Float, index: Int, total: Int, ramp: Float): Float {
+        if (total <= 0) return 0f
+        if (ratio < APPEAR_RATIO) return 1f - appearAlpha(ratio, index, total, ramp)
+        return if (index < LOD_MID_PLANETS) {
+            1f
+        } else {
+            ((APPEAR_RATIO + ramp - ratio) / ramp.coerceAtLeast(1e-4f)).coerceIn(0f, 1f)
+        }
+    }
+
+    /**
      * 尘埃档浮现度（0..1）：星深 [DUST_GAP_MIN, DUST_GAP_MAX] 带渐显（越近越浓；
      * 行星层井深比门由调用方把关——行星未亮的星不谈尘埃）。
      */

@@ -15,9 +15,11 @@ import java.io.File
  *    半边=nearFade01 P2 零改锚/渲染器半边=volumeFade01+emissionAlpha01 同帽）；
  *  - ②步数分档常量锚：64/40（§5.2「40~64 步」）+tier→(步数,分辨率除数) 纯函数
  *    真测；
- *  - ③highp 全程源锚：RAYMARCH_FS 头档 highp+噪声消费（R357 类闸联动——新噪声
- *    FS 忘抬档即红）+合成 FS 守 mediump（性能账）+NEBULA_FS 同族 fbm3 常量对表
- *    （GLSL 侧单源：两 FS 块家族数值基因逐一互证，任一侧漂移即红）；
+ *  - ③highp 全程源锚：RAYMARCH_FS 头档 highp（R392 判词③翻新——保留理由换为
+ *    射线几何/深度比较需 fp32，与噪声无关；噪声载体=烘焙纹理 fieldAt 采样）+
+ *    合成 FS 守 mediump（性能账）+NEBULA_FS 同族噪声场常量对表（家族构造数值
+ *    基因两半边逐一互证，任一侧漂移即红；载体=NoiseVolumeBaker 烘焙体两 FS
+ *    共享单件——GLSL 噪声库不再逐字共享）；
  *  - ④降级链序锚：3→2→1→0 退出回 billboard 纯函数行为测+退出粘滞+渲染器持态
  *    单源消费（demote/promote 无第二份判定）；
  *  - ⑤深度合成挂位锚：renderVolume 先于 endSceneComposite（挂位=blur 前）+
@@ -112,7 +114,10 @@ class R383WiringSourceTest {
     fun 步数分档_常量单源与tier映射() {
         assertEquals("步数质量档=64", 64, GlVolumePolicy.STEPS_HIGH)
         assertEquals("步数省税档=40", 40, GlVolumePolicy.STEPS_LOW)
-        assertEquals("起始档=半分辨率 64 步（满质量起步）", GlVolumePolicy.TIER_HALF_HIGH, GlVolumePolicy.TIER_START)
+        // R392 判词④翻新：低开高走——起步即 quarter 省税档（40 步×1/4 分辨率），
+        // 既有健康窗升档链自证后自动爬回满配（强机约 20s 满档），弱机不再先挨
+        // 满配幻灯片；「诚实降级」语义不变、方向反转=先证明跑得动再给质量
+        assertEquals("起始档=quarter 40 步（R392 判词④低开高走——先证明跑得动再给质量）", GlVolumePolicy.TIER_QUARTER, GlVolumePolicy.TIER_START)
         assertEquals(64, GlVolumePolicy.stepsOf(GlVolumePolicy.TIER_HALF_HIGH))
         assertEquals(40, GlVolumePolicy.stepsOf(GlVolumePolicy.TIER_HALF_LOW))
         assertEquals("quarter 档恒 40 步（省税——降档砍分辨率不叠步数）", 40, GlVolumePolicy.stepsOf(GlVolumePolicy.TIER_QUARTER))
@@ -122,27 +127,32 @@ class R383WiringSourceTest {
     }
 
     /**
-     * ③ highp 全程源锚+同族 fbm3 常量对表：RAYMARCH_FS=噪声消费 FS 全程 highp
-     * （R357 类闸联动——fp16 塌噪声病根）+合成 FS 守 mediump（无噪声件性能账）
-     * +NEBULA_FS 家族数值基因对表（GLSL 侧单源共享常量——两 FS 块任一侧漂移即红；
-     * NEBULA_FS 文本零碰红线所迫，单源锁在测试侧的诚实口径）。
+     * ③ highp 全程源锚+同族噪声场常量对表：RAYMARCH_FS 全程 highp（R392 判词③
+     * 翻新——保留理由=射线几何/深度比较需 fp32，与噪声无关）+合成 FS 守 mediump
+     * （无噪声件性能账）+NEBULA_FS 家族构造数值基因对表（两 FS 块任一侧漂移即红；
+     * NEBULA_FS 文本零碰红线所迫，单源锁在测试侧的诚实口径。R392 判词①：载体=
+     * NoiseVolumeBaker 烘焙 3D 纹理两 FS 共享单件，构造基因对表不变）。
      */
     @Test
     fun highp全程_源锚与同族常量对表() {
         val gs = shaders()
         val ray = fsBlock(gs, "RAYMARCH_FS")
         assertTrue(
-            "RAYMARCH_FS 必须 precision highp float（R357 噪声 FS 类闸成员）",
+            "RAYMARCH_FS 必须 precision highp float（R392 判词③——射线几何/深度比较需 fp32，与噪声无关）",
             Regex("precision highp float;").containsMatchIn(ray.substring(0, 200)),
         )
-        assertTrue("RAYMARCH_FS 噪声消费在场（fbm3 同族密度场）", ray.contains("fbm3"))
-        assertTrue("RAYMARCH_FS 共享噪声库单源（NOISE_3D 插值）", gs.contains("\$NOISE_3D") && ray.contains("fbm3(fq"))
+        assertTrue("RAYMARCH_FS 噪声消费在场（fieldAt 烘焙体采样——R392 载体革命）", ray.contains("fieldAt("))
+        assertTrue(
+            "NOISE_3D 库文件级存活（PLANET 族消费）+RAYMARCH_FS 密度场=fieldAt(fq…) 采样（R392 载体）",
+            gs.contains("\$NOISE_3D") && ray.contains("fieldAt(fq"),
+        )
         val comp = fsBlock(gs, "VOLUME_COMPOSITE_FS")
         assertTrue(
             "VOLUME_COMPOSITE_FS 守 mediump（无噪声件性能账——R357 守档锚）",
             Regex("precision mediump float;").containsMatchIn(comp.substring(0, 200)),
         )
-        // 家族数值基因对表：NEBULA_FS 与 RAYMARCH_FS 逐一互证（GLSL 侧单源共享）
+        // 家族构造数值基因对表：NEBULA_FS 与 RAYMARCH_FS 逐一互证（R392 后载体=
+        // 共享烘焙体、构造基因两半边对表仍在——任一侧漂移即红）
         val neb = fsBlock(gs, "NEBULA_FS")
         // 密度场空间频率+种子 z（R383d Mali S0008 修笔——锚与源同刀翻正：NEBULA_FS 2D
         // 语境 vec3(st*2.1,uSeed)=vec3(vec2,float) 3 对 3 合法原式零碰；RAYMARCH_FS q
@@ -157,14 +167,23 @@ class R383WiringSourceTest {
         for (gene in listOf(
             "smoothstep(0.12, 1.0",      // 径向 falloff
             "ridge * 0.85",              // 丝缕脊线 max 权
-            "smoothstep(0.40, 0.82",     // 密度剖面门
             "smoothstep(0.62, 0.88",     // 暗尘埃带门
             "0.55 * lane",               // 尘埃带减除强度
             "0.70 + 1.05",               // 明度纵深（色温分层同族）
         )) {
             assertTrue("家族基因 $gene 必须在 NEBULA_FS 在场", neb.contains(gene))
-            assertTrue("家族基因 $gene 必须在 RAYMARCH_FS 在场（同族 fbm3 单源对表——漂移即红）", ray.contains(gene))
+            assertTrue("家族基因 $gene 必须在 RAYMARCH_FS 在场（同族噪声场构造基因对表——漂移即红）", ray.contains(gene))
         }
+        // R388 刀2 翻新：密度剖面门基因两侧分立锚——NEBULA_FS 侧=稀疏化 gateLo
+        // 标度态（scale=1 位移零=0.40 家族值恒等）；RAYMARCH_FS 侧原样（贴脸
+        // crossfade 窗 billboard 已渐出=两半边共在窗恒 scale=1，家族对表判词保义
+        // ——远档标度只在 billboard 档，体积半边 P3 零碰）
+        assertTrue(
+            "家族门基因 NEBULA_FS 侧=gateLo 标度态（0.40 家族值在位移式零点恒等）",
+            neb.contains("float gateLo = 0.40 + 0.24 * (1.0 - uFreqScale);") &&
+                neb.contains("float a = smoothstep(gateLo, 0.82, d2) * fall * uAlpha;"),
+        )
+        assertTrue("家族门基因 RAYMARCH_FS 侧原样（0.40..0.82 直书——P3 零碰）", ray.contains("smoothstep(0.40, 0.82"))
         // R357 类闸联动复诵（新噪声 FS 忘抬档即红的结构面）
         val m = Regex("const val RAYMARCH_FS = \"\"\"#version 300 es\\s+precision (\\w+) float;").find(gs)
         assertTrue("RAYMARCH_FS 头档可解析（R357 类闸同式）", m != null)
@@ -178,18 +197,25 @@ class R383WiringSourceTest {
      */
     @Test
     fun 降级链序_退出回billboard与退出粘滞() {
-        // 降级链序：64步半→40步半→40步quarter→退出（0 地板）
-        var t = GlVolumePolicy.TIER_START
+        // 降级链序（R392 判词④翻新：TIER_START 改 quarter 后，全链语义自满配
+        // 天花板起验——64步半→40步半→40步quarter→退出（0 地板））
+        var t = GlVolumePolicy.TIER_HALF_HIGH
         val chain = ArrayList<Int>(4)
         repeat(3) { t = GlVolumePolicy.demote(t); chain += t }
-        assertEquals("三级降档链序=2,1,0（退出=降级链终点）", listOf(2, 1, 0), chain)
+        assertEquals("三级降档链序=2,1,0（退出=降级链终点——自满配天花板起）", listOf(2, 1, 0), chain)
         assertEquals("退出档=地板（再降不动）", 0, GlVolumePolicy.demote(0))
-        // 升档恢复：0→1→2→3（天花板）
+        // 升档恢复：0→1→2→3（天花板）——链序与 R392 前同，只起始档语义反转
         var u = GlVolumePolicy.TIER_EXIT
         val up = ArrayList<Int>(3)
         repeat(3) { u = GlVolumePolicy.promote(u); up += u }
-        assertEquals("升档链=1,2,3（满质量天花板）", listOf(1, 2, 3), up)
-        assertEquals("起始档=天花板（再升不动）", 3, GlVolumePolicy.promote(3))
+        assertEquals("升档链=1,2,3（满质量天花板——链序不变）", listOf(1, 2, 3), up)
+        // R392 判词④新增：自起始档 quarter 低开，健康窗升档链两级爬回满配
+        // （先证明跑得动再给质量——强机约 20s 满档）
+        var s = GlVolumePolicy.TIER_START
+        val fromStart = ArrayList<Int>(2)
+        repeat(2) { s = GlVolumePolicy.promote(s); fromStart += s }
+        assertEquals("自起始档 quarter 升档=半40→满配（R392 判词④低开高走自动爬回）", listOf(2, 3), fromStart)
+        assertEquals("满配=天花板（再升不动）", 3, GlVolumePolicy.promote(3))
         // 退出粘滞：退出档升回须 3 窗（防退出↔重入拍动），其余 2 窗=R376 滞回同构
         assertEquals(3, GlVolumePolicy.healthyWinsToPromote(0))
         assertEquals(2, GlVolumePolicy.healthyWinsToPromote(1))

@@ -10,7 +10,7 @@ package dev.tgfeed.ui.gl
  *   档）/[STEPS_LOW]=40（省税档）；
  * - **降级链序**（§5.2「步数/分辨率降档→仍不过=退出 raymarch 档回远景 billboard」
  *   ——观感降级、语义与门连续=诚实降级 GlEnginePolicy 同口径）：
- *   tier 3=64 步半分辨率（起始档）→ 2=40 步半分辨率 → 1=40 步 quarter 分辨率 →
+ *   tier 3=64 步半分辨率（满配——起始档自 R392 改为 [TIER_START]=quarter）→ 2=40 步半分辨率 → 1=40 步 quarter 分辨率 →
  *   **0=退出**（=P2 行为原样：billboard nearFade 渐出窗仍在、体积零趟——门语义
  *   不撤只是不给体积内饰，语义与门连续的结构兑现）；
  * - **帧率门口径**（§六「慢帧 ≤1%」+R376 LOD 同构滞回）：5s 统计窗慢帧>2%
@@ -39,16 +39,20 @@ internal object GlVolumePolicy {
     /** 半分辨率 40 步档（降档第一级） */
     const val TIER_HALF_LOW = 2
 
-    /** 半分辨率 64 步档（起始档——满质量） */
+    /** 半分辨率 64 步档（满质量天花板——升档链终点；R392 起不再兼任起始档） */
     const val TIER_HALF_HIGH = 3
 
-    /** 会话起始档（满质量起步——门不过再诚实降） */
-    const val TIER_START = TIER_HALF_HIGH
+    /**
+     * 会话起始档（**R392 判词④低开高走**：起步即省税档 quarter×40——既有健康窗
+     * 升档链自证后自动爬回满配（强机约 20s 后满档），弱机不再先挨幻灯片。
+     * 「诚实降级」语义不变、方向反转：先证明跑得动，再给质量）
+     */
+    const val TIER_START = TIER_QUARTER
 
     /** 单次降档（0 地板=退出链终点；越界防御钳位） */
     fun demote(tier: Int): Int = (tier - 1).coerceAtLeast(TIER_EXIT)
 
-    /** 单次升档（起始档天花板；越界防御钳位） */
+    /** 单次升档（满质量天花板；越界防御钳位） */
     fun promote(tier: Int): Int = (tier + 1).coerceAtMost(TIER_HALF_HIGH)
 
     /** 档→步数（64 步只属半分辨率质量档；quarter 档恒 40 步省税） */

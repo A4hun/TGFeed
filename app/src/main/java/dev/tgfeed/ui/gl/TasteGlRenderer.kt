@@ -4,6 +4,7 @@ import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import android.util.Log
 import dev.tgfeed.core.tastemap.DeepSpaceNebula
+import dev.tgfeed.core.tastemap.NoiseVolumeBaker
 import dev.tgfeed.core.tastemap.TasteSpace
 import dev.tgfeed.ui.TasteFlightFrame
 import java.nio.ByteBuffer
@@ -190,6 +191,15 @@ internal class TasteGlRenderer(
     private var uSeedNeb = -1
     private var uTimeNeb = -1
 
+    /** R388 刀2 丝缕频率标度（NEBULA_FS 第五件——OP_NEBULA 回放逐 quad 上传槽 9） */
+    private var uFreqNeb = -1
+
+    /** R392 噪声体 sampler 位（NEBULA_FS 第六件——烘焙 3D fbm 体，常驻单元 2 单源） */
+    private var uNoiseVolNeb = -1
+
+    /** R392 噪声体纹理句柄（onSurfaceCreated 一次烘焙上传——EGL 重建随上下文重走） */
+    private var noiseVolTex = 0
+
     private var viewW = 0
     private var viewH = 0
 
@@ -309,7 +319,8 @@ internal class TasteGlRenderer(
             progRock = GlShaders.buildProgram(GlShaders.ROCK_VS, GlShaders.ROCK_FS)
             progNebula = GlShaders.buildProgram(GlShaders.NEBULA_VS, GlShaders.NEBULA_FS)
             progSphereI = GlShaders.buildProgram(GlShaders.SPHERE_I_VS, GlShaders.SPHERE_I_FS)
-            postFx.recreate()
+            // R392：postFx.recreate(noiseVolTex) 移至噪声体上传段之后（recreate 消费
+            // 单元 2 常驻约定——调用点必须排在上传之后）
             uViewportPoint = GLES30.glGetUniformLocation(progPoint, "uViewport")
             uViewportLine = GLES30.glGetUniformLocation(progLine, "uViewport")
             uViewportQuad = GLES30.glGetUniformLocation(progQuad, "uViewport")
@@ -396,6 +407,8 @@ internal class TasteGlRenderer(
             uAlphaNeb = GLES30.glGetUniformLocation(progNebula, "uAlpha")
             uSeedNeb = GLES30.glGetUniformLocation(progNebula, "uSeed")
             uTimeNeb = GLES30.glGetUniformLocation(progNebula, "uTime")
+            uFreqNeb = GLES30.glGetUniformLocation(progNebula, "uFreqScale")
+            uNoiseVolNeb = GLES30.glGetUniformLocation(progNebula, "uNoiseVol") // R392 噪声体 sampler
 
             // VBO 族预分配满帽（帧路径只 SubData）+静态网格三件（球/岩石/环带/天幕）
             // R349 清点：17 个（原 14 + 低模球 mesh/IBO/实例三件——ids[14..16]）
@@ -529,6 +542,20 @@ internal class TasteGlRenderer(
             texMap[GlFrameBuilder.TEX_FOG] = GlShaders.uploadTexture(GlTextureBaker.bakeFog(), GlTextureBaker.FOG_SIZE, GlTextureBaker.FOG_SIZE)
             texMap[GlFrameBuilder.TEX_WHITE] = GlShaders.uploadTexture(GlTextureBaker.bakeWhite(), GlTextureBaker.WHITE_SIZE, GlTextureBaker.WHITE_SIZE)
 
+            // R392 噪声体 3D 纹理（载体革命——NEBULA/RAYMARCH 两域共享单件；常驻单元 2
+            // 绑定一次即成，帧路径零新调用。单元 0/1=postFx 占用，全仓 GL_TEXTURE2
+            // grep 证零碰撞；EGL 重建=onSurfaceCreated 全链重走天然覆盖）
+            val tNb0 = System.nanoTime()
+            noiseVolTex = GlShaders.uploadTexture3D(NoiseVolumeBaker.bakeMemo(), NoiseVolumeBaker.SIZE)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, noiseVolTex)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0) // 恢复默认单元
+            GLES30.glUseProgram(progNebula)
+            GLES30.glUniform1i(uNoiseVolNeb, 2)
+            GLES30.glUseProgram(0)
+            Log.i("TasteMapX", "R392 噪声体: ${NoiseVolumeBaker.SIZE}³ 烘焙+上传=${"%.0f".format((System.nanoTime()-tNb0)/1e6f)}ms 单元=2")
+            postFx.recreate(noiseVolTex)
+
             // 全局状态：单一混合模式（Canvas SRC_OVER 等价）；深度函数默认 LESS
             GLES30.glDepthFunc(GLES30.GL_LEQUAL)
             GLES30.glDisable(GLES30.GL_DEPTH_TEST)
@@ -536,7 +563,7 @@ internal class TasteGlRenderer(
             GLES30.glEnable(GLES30.GL_BLEND)
             GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
             GLES30.glClearColor(0f, 0f, 0f, 1f) // InkBlack=纯黑（深空底色同 Compose 背景）
-            Log.i("TasteMapX", "R281 GL: 上下文建成（ES3 程序×16=14+R383 体积两件 raymarch/深度合成+后处理 FBO 组+球网格 ${GlSphereMesh.SLICES}×${GlSphereMesh.STACKS}+R349 低模球 ${GlSphereMesh.LOD_SLICES}×${GlSphereMesh.LOD_STACKS} instanced ${GlFrameBuilder.MAX_SPHERE_I} 帽+岩石汤 ${GlRockMesh.SOUP_VERTS}v+环带 ${GlRingMesh.SEGMENTS} 段+天幕静态 VBO ${TasteSpace.SKY_STARS}+纹理×6+VBO×17）")
+            Log.i("TasteMapX", "R281 GL: 上下文建成（ES3 程序×16=14+R383 体积两件 raymarch/深度合成+后处理 FBO 组+球网格 ${GlSphereMesh.SLICES}×${GlSphereMesh.STACKS}+R349 低模球 ${GlSphereMesh.LOD_SLICES}×${GlSphereMesh.LOD_STACKS} instanced ${GlFrameBuilder.MAX_SPHERE_I} 帽+岩石汤 ${GlRockMesh.SOUP_VERTS}v+环带 ${GlRingMesh.SEGMENTS} 段+天幕静态 VBO ${TasteSpace.SKY_STARS}+纹理×6+噪声体3D+VBO×17）")
         } catch (t: Throwable) {
             reportFatal(t)
         }
@@ -911,6 +938,9 @@ internal class TasteGlRenderer(
                     GLES30.glUniform1f(uTimeNeb, nb[i + 4])
                     GLES30.glUniform3f(uColorNeb, nb[i + 5], nb[i + 6], nb[i + 7])
                     GLES30.glUniform1f(uAlphaNeb, nb[i + 8])
+                    // R388 刀2：槽 9 频率标度（雾族行恒 1=既有基因；复合体行=
+                    // clamp(rPx/REF, floor, 1)——远小 quad 低频粗丝）
+                    GLES30.glUniform1f(uFreqNeb, nb[i + 9])
                     GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vboUnitQuad)
                     GLES30.glEnableVertexAttribArray(0)
                     GLES30.glVertexAttribPointer(0, 2, GLES30.GL_FLOAT, false, 8, 0)
@@ -1028,7 +1058,7 @@ internal class TasteGlRenderer(
             volWindowHadVolume = false
             Log.i(
                 "TasteMapX",
-                "R281 GL帧率: %.1ffps 慢帧=%.1f%% 末帧(点=${builder.pointCount} 线=${builder.lineVertCount} 四边形=${builder.quadCount} 球=${builder.statSphereStars} 冕=${builder.statCoronas} 行星=${builder.statPlanets} 环=${builder.ringCount} 岩石=${builder.statRocks} 可见星=${builder.statVisibleStars} 微星=${builder.statMicroStars} op=${builder.opCount} 装配=%.2fms(景%.2f/星%.2f/效%.2f) 上传=%.2fms 回放=%.2fms 后处理=%.2fms)".format(
+                "R281 GL帧率: %.1ffps 慢帧=%.1f%% 末帧(点=${builder.pointCount} 线=${builder.lineVertCount} 四边形=${builder.quadCount} 球=${builder.statSphereStars} 冕=${builder.statCoronas} 行星=${builder.statPlanets} 微点行星=${builder.statPlanetDots} 环=${builder.ringCount} 岩石=${builder.statRocks} 可见星=${builder.statVisibleStars} 微星=${builder.statMicroStars} op=${builder.opCount} 装配=%.2fms(景%.2f/星%.2f/效%.2f) 上传=%.2fms 回放=%.2fms 后处理=%.2fms)".format(
                     fpsFrames / sec, fpsSlow * 100f / fpsFrames,
                     (t1 - t0) / 1_000_000f, builder.statSceneMs, builder.statStarsMs, builder.statFxMs,
                     (t2 - t1) / 1_000_000f, (t3 - t2) / 1_000_000f, (t4 - t3) / 1_000_000f,

@@ -204,8 +204,13 @@ internal class GlFrameBuilder {
         /** 岩石实例步长：位+径 4 + 轴+角 4 + 色+alpha 4 + 光向+热缘 4 + 种子 1 */
         const val ROCK_STRIDE = 17
 
-        /** 星云实例步长：屏位 2 + 半幅 1 + 种子 1 + 时间 1 + 色 3 + alpha 1 */
-        const val NEB_STRIDE = 9
+        /**
+         * 星云实例步长：屏位 2 + 半幅 1 + 种子 1 + 时间 1 + 色 3 + alpha 1 +
+         * **频率标度 1**（R388 刀2 槽 9=uFreqScale 装配值——TasteGlRenderer
+         * OP_NEBULA 回放上传；雾族行恒 1f=既有基因恒等，复合体行=clamp(rPx/
+         * [cpxFilRefPx], [CPX_FIL_FLOOR], 1)）
+         */
+        const val NEB_STRIDE = 10
 
         /** 光斑源步长：ndc 2 + 色 3 + 强度 1 + 正对度 1 */
         const val FLARE_STRIDE = 7
@@ -222,7 +227,8 @@ internal class GlFrameBuilder {
      * 星云实例帽（R351 雾絮化 12→24 扩容——帽账：雾 6 团×blob 3=18 顶格+发射
      * 电离侧辉 ≤6=24 顶格；奥伯斯 18 向壳共用此帽——雾满时壳让位的溢帽静默
      * 截断语义保持（R319b 后既有行为），本批零语义变化只扩容。nebBuf
-     * 12×9=108→24×9=216 浮点=预分配一次性扩容，帧零分配纪律保持）。
+     * 12×9=108→24×9=216 浮点=预分配一次性扩容（R388 槽 10 后=24×10=240——频率
+     * 标度槽随步长同步扩容），帧零分配纪律保持）。
      */
     const val MAX_NEBULAS = 24
 
@@ -232,7 +238,8 @@ internal class GlFrameBuilder {
      * 单层=4——合计 16 顶格。**与 MAX_NEBULAS=24 雾行合并审计定帽 40**：
      * 雾行（雾团+奥伯斯壳+发射侧辉）独享原 24 帽零挤压（P1 结论零碰——复合体
      * 走 [addNebulaCpx] 独立计数写入 nebBuf 的 24 槽后段），总帽=nebBuf 容量
-     * （24+16）×NEB_STRIDE=360 浮点=预分配一次性扩容，帧零分配纪律保持。
+     * （24+16）×NEB_STRIDE 浮点（R388 槽 10 后=400）=预分配一次性扩容，帧零
+     * 分配纪律保持。
      */
     const val MAX_NEBULA_CPX = 16
         const val MAX_FLARES = 3
@@ -254,6 +261,55 @@ internal class GlFrameBuilder {
          * NEBULA_FS 脊线丝缕+丝间留空单型干净在场——**远=单层即丝缕形态保义**。
          */
         const val CPX_FAR_MIN_DP = 150f
+
+        /**
+         * R388 刀1 复合体远档隐没带内沿（**dp 基准**——px 阈=本值×密度入帧字段
+         * [cpxFarHideMinPx]，R386 [CPX_FAR_MIN_DP] 同式先例）：复合体投影半径
+         * 低于此值=**看不清就不画**（直接 continue 零装填——诚实缺省同族：亚
+         * 分辨圆饼读作星场；含 [buildComplexesR373] 富集反射微光块——同一病类
+         * 同带）。判词（用户 2026-10-25 14:1x 裁决根治刀）：星图全景纯星空，
+         * 飞近才见云——R351 弥散保义下圆包络不可锐边治，**「不画」是唯一根治位**。
+         * 校准轮 1（2026-10-25 16:2x 小米实测）：60→90dp——带下沿抬至亚分辨
+         * 区上沿（225px@2.5 档 quad 半径以下丝缕不可辨）。
+         */
+        const val CPX_FAR_HIDE_MIN_DP = 90f
+
+        /**
+         * R388 刀1 复合体远档隐没带外沿（dp 基准——px 阈=本值×密度入帧字段
+         * [cpxFarHideMaxPx]）：带内 [CPX_FAR_HIDE_MIN_DP]..本值 C¹ smoothstep
+         * 渐隐至零（[farHide01] 单源），带外满档=交 R388 刀2 频率锁定档（判词链
+         * 「星场→稀粗丝」的交界带）。**消光账同步**：cpxPresence（消光半边）
+         * 乘同一淡出因子——看不见的云不减光（物理一致：隐没复合体在星层
+         * pass1 不再挡光，R385 P4 消费口其余零碰）。
+         * 校准轮 1（16:2x 小米全景像素定量：病灶复合体辉斑 1376×896px/等效
+         * R452px=181dp/平均亮度 24.5——rPx0 量级 550~700px≈220~280dp）：110→
+         * 200dp（500px@2.5）——带外沿抬至覆盖中小复合体全景档；大复合体
+         * （>200dp）交刀2 稀粗丝档不再整团隐没（判词链「远=稀粗丝」正位）。
+         */
+        const val CPX_FAR_HIDE_MAX_DP = 200f
+
+        /**
+         * R388 刀2 丝缕频率锁定参考屏半径（**dp 基准**——px 阈=本值×密度入帧
+         * 字段 [cpxFilRefPx]）：复合体/富集 quad 投影半径 rPx≥此值=scale 1
+         * （**既有设计基因原样**——近档纱幔多层视差=梦的本体零碰）；rPx<此值=
+         * scale=clamp(rPx/此值, [CPX_FIL_FLOOR], 1)（NEBULA_FS 第五件
+         * uFreqScale——丝缕噪声频率×scale：远小 quad 低频=**粗丝留空大**，
+         * 任何屏距丝缕像素宽恒定）。判词：「丝缕基因的尺度变换非基因改变」——
+         * 同一噪声场 zoom（z=种子身份槽不动）；R358 判词「丝间留空看得见底星」
+         * 在远距由恒定丝宽真正成立。终态链：星场（极远）→稀粗丝（远）→纱幔
+         * （近）→raymarch 体积（贴脸，P3 零碰）。
+         * 校准轮 1（2026-10-25 16:2x 小米实测）：220→300dp（750px@2.5）——
+         * 病灶复合体全景 blob rPx 300~688px 原多落 REF 上方=scale 1 全基因
+         * 两层叠=饼回潮；REF 抬至其上使全景 blob 落 0.40~0.92 标度域=稀粗
+         * 丝档（刀2 首次真正咬到病灶）。
+         */
+        const val CPX_FIL_REF_DP = 300f
+
+        /**
+         * R388 刀2 频率标度下限（纯比值零密度口径）：超远 quad 防退化单团
+         * （scale 地板 0.35≈图案 2.9× 粗——再低=一个噪声胞元糊满 quad=新病）。
+         */
+        const val CPX_FIL_FLOOR = 0.35f
 
         /** 尘埃岩石化门槛（px——尘点视尺寸 ≥ 此值时前 24 粒换岩石真身） */
         private const val DUST_ROCK_MIN_PX = 3.0f
@@ -392,6 +448,13 @@ internal class GlFrameBuilder {
         private set
     var statPlanets = 0
         private set
+
+    /**
+     * R399 行星微点计数（count 轴微点腿+远档微点档——「未浮现」态行星的可见
+     * 形态 census；探针行「行星=N 微点行星=M」对账口径=缩放各档吞门退役实锚）。
+     */
+    var statPlanetDots = 0
+        private set
     var statRocks = 0
         private set
 
@@ -432,11 +495,37 @@ internal class GlFrameBuilder {
     private var lodPointCeilPx = TasteLodPolicy.POINT_CEIL_DP
 
     /**
+     * R399 本帧行星微点直径地板 px（build 首算——[TasteLodPolicy.microDotPx]：
+     * max(2.2px, 1.2dp×density)；count 轴微点腿+buildPlanetBody 点腿尺寸地板
+     * 共消费——亚像素行星=最小可见亮点不蒸发；初值=裸像素下限=mdpi 恒等档）。
+     */
+    private var lodMicroDotPx = TasteLodPolicy.MICRO_DOT_MIN_PX
+
+    /**
      * R386 本帧复合体远档阈 px（build 首算——[CPX_FAR_MIN_DP]×密度：150dp×
      * density；buildComplexesR373 远档层数裁剪消费——密度岔路闭合（400dpi 档
      * 375px：同 dp 同路由=跨密度形态一致）；初值=mdpi 恒等档）。
      */
     private var cpxFarMinPx = CPX_FAR_MIN_DP
+
+    /**
+     * R388 刀1 本帧复合体远档隐没带内沿 px（build 首算——[CPX_FAR_HIDE_MIN_DP]
+     * ×density；buildComplexesR373 带下不画消费——初值=mdpi 恒等档）。
+     */
+    private var cpxFarHideMinPx = CPX_FAR_HIDE_MIN_DP
+
+    /**
+     * R388 刀1 本帧复合体远档隐没带外沿 px（build 首算——[CPX_FAR_HIDE_MAX_DP]
+     * ×density；[farHide01] 带内 C¹ 渐隐消费——初值=mdpi 恒等档）。
+     */
+    private var cpxFarHideMaxPx = CPX_FAR_HIDE_MAX_DP
+
+    /**
+     * R388 刀2 本帧丝缕频率锁定参考屏半径 px（build 首算——[CPX_FIL_REF_DP]×
+     * density；buildComplexesR373 每 quad scale=clamp(rPx/此值, [CPX_FIL_FLOOR],
+     * 1) 装填槽 9——初值=mdpi 恒等档）。
+     */
+    private var cpxFilRefPx = CPX_FIL_REF_DP
 
     /** R349 低模球计数（探针/单测锚——[statSphereStars] 的低模半边） */
     var statSphereLow = 0
@@ -470,6 +559,20 @@ internal class GlFrameBuilder {
      *  dp 帧字段——密度档域）
      *  （R349 形态线；点云层星不拆云/3D 真身非点源不参选——resolved 无芒） */
     var statSpikeCand = 0
+        private set
+
+    // ==================== R388 刀1/刀2 探针（校准腿计数行——statLodLine 消费） ====================
+
+    /** R388 探针：本帧最大复合体/富集 quad 半径 px（装配期记——校准轮判读原料） */
+    var statCpxRpx = 0f
+        private set
+
+    /** R388 探针：同 quad 远档隐没因子（farHide01 带内渐隐活值） */
+    var statCpxFarHide = 0f
+        private set
+
+    /** R388 探针：同 quad 丝缕频率标度（刀2 scale 活值） */
+    var statCpxFilScale = 0f
         private set
 
     /** R339 星芒入选星数（探针/单测锚——top 门截断后实际发芒的星数，
@@ -683,9 +786,13 @@ internal class GlFrameBuilder {
         statLodDropped = 0
         statCoronas = 0
         statPlanets = 0
+        statPlanetDots = 0
         statRocks = 0
         statSpikeCand = 0
         statSpikeStars = 0
+        statCpxRpx = 0f
+        statCpxFarHide = 0f
+        statCpxFilScale = 0f
         flareScore.fill(0f)
         // R349 回退旋钮入参 → 本帧 effective 阈值（政策件纯函数单源——点档上限
         // POINT_CEIL 恒 1.2dp 不随 bias 动：形态线换轨+数量线正交）；
@@ -697,7 +804,17 @@ internal class GlFrameBuilder {
         lodPointCeilPx = TasteLodPolicy.pointCeilPx(lodDensity)
         lodSolidFloorPx = TasteLodPolicy.effectiveSolidFloor(lodDensity, lodSolidBias)
         lodLowMeshMaxPx = TasteLodPolicy.effectiveLowMeshMax(lodDensity, lodMeshBias)
+        // R399 微点地板（R355 密度单口换算同块第八条——政策件单源，别处零乘法）
+        lodMicroDotPx = TasteLodPolicy.microDotPx(lodDensity)
         cpxFarMinPx = CPX_FAR_MIN_DP * lodDensity
+        // R388 刀1 隐没带双阈同块第五/六条（dp 基准 60/110dp×密度——「看不清
+        // 就不画」带下 continue+带内渐隐；同 dp 同形态=跨密度一致，mdpi 恒等档
+        // 60/110px 数值原样=基线路由零变化）
+        cpxFarHideMinPx = CPX_FAR_HIDE_MIN_DP * lodDensity
+        cpxFarHideMaxPx = CPX_FAR_HIDE_MAX_DP * lodDensity
+        // R388 刀2 频率锁定参考屏半径第七条（dp 基准 220dp×密度——阈上 scale=1
+        // 既有基因原样；mdpi 恒等档 220px 数值原样）
+        cpxFilRefPx = CPX_FIL_REF_DP * lodDensity
         if (w <= 0f || h <= 0f) return
         // 注：空星表不早退——天幕+网格照常（Canvas 同口径：空宇宙≠黑屏）
 
@@ -1392,6 +1509,21 @@ internal class GlFrameBuilder {
     // ==================== R280 P1：星云 / 星轨 / 流光 / 尘埃带 / 星座轨迹 ====================
 
     /**
+     * R388 刀1 复合体远档隐没因子（0..1，C¹ smoothstep——「看不清就不画」的
+     * **带内渐隐半边单源**：带下 0/带内渐升/带外 1）。三口同因子消费（物理
+     * 一致铁律）：①复合体 blob 装 alpha；②富集反射微光 alpha；③消光账
+     * cpxPresence——看不见的云不减光。带下 0 由调用方 continue 收口（本函数
+     * 只算带，不做门）。
+     */
+    private fun farHide01(rPx: Float): Float {
+        val lo = cpxFarHideMinPx
+        val hi = cpxFarHideMaxPx
+        if (hi <= lo) return if (rPx >= hi) 1f else 0f // 防御（异常密度档）——不拦
+        val k = ((rPx - lo) / (hi - lo)).coerceIn(0f, 1f)
+        return k * k * (3f - 2f * k)
+    }
+
+    /**
      * R373 深空星云复合体+富集反射云（design-nebula §5.1 远景档——雾族管线家族
      * 扩展，P1 结论零碰零改写）：
      *  - 复合体 blob 走 NEBULA_FS **同程序 uniform 变体**（零新程序零 NEBULA_FS
@@ -1422,6 +1554,13 @@ internal class GlFrameBuilder {
      *    星未亮黯淡）+超新星 enrich 脉冲（[scanComplexPulseR385]——CYCLE_PULSE
      *    共在窗单源直引）+**复合体屏位账**（云心投影/视半径/深度/在场度 ≤4 团——
      *    星层 pass1 复合体级消光判定原料，镜像 R320 雾屏位账口径）。
+     *  - **R388 刀1 远档隐没**（用户 2026-10-25 14:1x 裁决根治刀——「看不清就
+     *    不画」）：复合体+富集反射微光同一病类同带（隐没带 [CPX_FAR_HIDE_MIN_DP]
+     *    ..[CPX_FAR_HIDE_MAX_DP] dp 基准×密度）——带下直接不画（亚分辨圆饼读
+     *    作星场=诚实缺省同族），带内 [farHide01] C¹ 渐隐至零；**消光账
+     *    cpxPresence 乘同一淡出因子**（看不见的云不减光——P4 消费口其余零碰）；
+     *    观感=星图全景纯星空，飞近才见云（R351 弥散保义：圆包络不锐边治，
+     *    「不画」是唯一根治位）。
      */
     private fun buildComplexesR373(
         f: TasteFlightFrame,
@@ -1449,6 +1588,15 @@ internal class GlFrameBuilder {
             val dist = TasteSpace.distTo(cam, c.cx, c.cy, c.cz)
             val nearFade = DeepSpaceNebula.nearFade01(dist, c.radius)
             if (nearFade <= 0.012f) continue
+            // R388 刀1：远档隐没带（看不清就不画——带下 continue 零装填；带内
+            // farHide01 C¹ 渐隐；投影失败=恒 1 既有路径不拦，blob 级守卫兜底）
+            var farHide = 1f
+            if (TasteSpace.project(c.cx, c.cy, c.cz, cam, focal, cx, cy, proj, basisArr)) {
+                val hideR = TasteNebula.fogPx(c.radius, proj[3])
+                if (hideR < cpxFarHideMinPx) continue
+                farHide = farHide01(hideR)
+                if (farHide <= 0.012f) continue // 带下沿（同 nearFade 地板口径——零值装填零成本）
+            }
             // R385 gas 档：帽内钳（克制档帽不被创世纪越过）+enrich 脉冲叠加（事件窗
             // ≤7s 瞬态——R323 星胚点脉冲同款加法口径，峰值 0.12+0.10=0.22 与 R358
             // 发射摇篮联动档 ~0.21 同量级先例）
@@ -1468,7 +1616,9 @@ internal class GlFrameBuilder {
                     cpxSy[ci] = proj[1]
                     cpxRpx[ci] = rPx0
                     cpxDepth[ci] = proj[2]
-                    cpxPresence[ci] = (baseCap * nearFade) / DeepSpaceNebula.CPX_ALPHA_MAX
+                    // R388 刀1：在场度乘同一淡出因子（消光半边同步出让——看不见
+                    // 的云不减光，物理一致；P4 消费口其余零碰）
+                    cpxPresence[ci] = (baseCap * nearFade * farHide) / DeepSpaceNebula.CPX_ALPHA_MAX
                 }
             }
             val seed = DeepSpaceNebula.churnSeedOf(c.cellKey, c.mass)
@@ -1500,9 +1650,15 @@ internal class GlFrameBuilder {
                 if (rPx > 2.5f * diag) continue // 巨雾护栏（雾族同款）
                 if (sx < -rPx || sx > w + rPx || sy < -rPx || sy > h + rPx) continue
                 GlPalette.rgbF(DeepSpaceNebula.emissionLayerColor(c.haMix01, c.cellKey, k), rgbA)
+                // R388 刀1：blob 装 alpha 乘同一淡出因子（baseA 行原字面零改——
+                // 淡出乘在装填口；脉冲随乘=隐没云不发脉冲微光）
+                // R388 刀2：丝缕频率标度（每 quad 自身 rPx 口径——任何屏距丝缕
+                // 像素宽恒定；阈值上=1 既有基因，下=clamp 至地板）
+                val filScale = (rPx / cpxFilRefPx).coerceIn(CPX_FIL_FLOOR, 1f)
+                if (rPx > statCpxRpx) { statCpxRpx = rPx; statCpxFarHide = farHide; statCpxFilScale = filScale }
                 addNebulaCpx(
                     sx, sy, rPx, seed + k * 13.7f, t,
-                    rgbA[0], rgbA[1], rgbA[2], baseA * flocAlphaPack[k],
+                    rgbA[0], rgbA[1], rgbA[2], baseA * flocAlphaPack[k] * farHide, filScale,
                 )
             }
         }
@@ -1520,12 +1676,21 @@ internal class GlFrameBuilder {
             )
             if (rPx > 2.5f * diag) continue
             if (sx < -rPx || sx > w + rPx || sy < -rPx || sy > h + rPx) continue
+            // R388 刀1：反射微光同一病类同带（看不清就不画——带下 continue+带内
+            // 同一 farHide01 单源渐隐；billboard 半径=本 blob rPx 口径）
+            if (rPx < cpxFarHideMinPx) continue
+            val farHide = farHide01(rPx)
             GlPalette.rgbF(e.colorArgb, rgbA)
             // R385 反射云创世纪档：星未亮的早期黯至地板（反射=星光的暗回声——
             // 诚实不为不存在的星光造亮；gas 档不作用于反射云）
+            // R388 刀1：同带淡出因子随乘（同一病类同带——隐没带物理一致）
+            // R388 刀2：反射微光同一频率锁定口径（rPx 本 quad 自身口径）
+            val filScale = (rPx / cpxFilRefPx).coerceIn(CPX_FIL_FLOOR, 1f)
+            if (rPx > statCpxRpx) { statCpxRpx = rPx; statCpxFarHide = farHide; statCpxFilScale = filScale }
             addNebulaCpx(
                 sx, sy, rPx, DeepSpaceNebula.churnSeedOf(e.cellKey, e.members.toFloat()), t,
-                rgbA[0], rgbA[1], rgbA[2], DeepSpaceNebula.enrichAlpha01() * reflectMult * nearFade,
+                rgbA[0], rgbA[1], rgbA[2], DeepSpaceNebula.enrichAlpha01() * reflectMult * nearFade * farHide,
+                filScale,
             )
         }
     }
@@ -2709,12 +2874,14 @@ internal class GlFrameBuilder {
         //      天然达标）+回退序①②③记账（bias/帽当前值——V51-③ 断言原料）；
         //      R355 密度+px 阈值行（两密度档 3D 出现一致性断言原料——V55：同视觉
         //      缩放级别下 芯=点档上限/低模线/球门 三 px 阈值×密度与计数族互证）；
-        //      ~6s 一条（statTickR339 同族节拍） ----
+        //      ~6s 一条（statTickR339 同族节拍）；
+        //      R388 刀1/刀2 校准腿计数行（复合体 quad 半径/隐没因子/丝缕标度
+        //      ——带与 REF 实测判读原料，纯计数脱敏） ----
         statTickR349++
         if (statTickR349 % 360 == 0) {
             android.util.Log.i(
                 "TasteMapX",
-                "R349 LOD: 可见星=${statVisibleStars} 微点=${statMicroStars} 低模球=${statSphereLow} 全模球=${statSphereFull} blend对=${statBlendPairs} 行星=${statPlanets} 岩石=${statRocks} 截断=${statLodDropped} bias=${lodSolidBias} mesh=${if (lodMeshBias > 100f) "全低模" else "常态"} 帽=${lodInstanceCap} 密度=${lodDensity} 阈px=${lodPointCeilPx}/${lodSolidFloorPx}/${lodLowMeshMaxPx}",
+                "R349 LOD: 可见星=${statVisibleStars} 微点=${statMicroStars} 低模球=${statSphereLow} 全模球=${statSphereFull} blend对=${statBlendPairs} 行星=${statPlanets} 微点行星=${statPlanetDots} 岩石=${statRocks} 截断=${statLodDropped} bias=${lodSolidBias} mesh=${if (lodMeshBias > 100f) "全低模" else "常态"} 帽=${lodInstanceCap} 密度=${lodDensity} 阈px=${lodPointCeilPx}/${lodSolidFloorPx}/${lodLowMeshMaxPx} R388复合体rPx=${statCpxRpx} 隐没=${statCpxFarHide} 丝缕标度=${statCpxFilScale}",
             )
         }
     }
@@ -3770,7 +3937,13 @@ internal class GlFrameBuilder {
         scx: Float, scy: Float, scz: Float,
     ) {
         val ratio = galaxyWellRatio(scx, scy, scz, s.vol, f.wellMaxVol, cam)
-        if (ratio >= TasteTagPlanets.APPEAR_RATIO) return
+        if (ratio >= TasteTagPlanets.APPEAR_RATIO) {
+            // R399 吞门退役：未浮现档=并入母星光晕的行星色微点（判词「优雅降级
+            // 而非消失」——行星永不整吞；重层（轨道线/宜居带/尘埃/球身）照旧全灭
+            // =降级本身省 draw，性能刀收益零回退）
+            buildPlanetMicroDotsR399(s, entry, cam, focal, t, w, h, cx, cy, scx, scy, scz, ratio)
+            return
+        }
         val distStar = TasteSpace.distTo(cam, scx, scy, scz)
         if (distStar <= TasteSpace.NEAR) return
         val sizeK = focal / distStar
@@ -3806,18 +3979,23 @@ internal class GlFrameBuilder {
         // R340 恒星相机系深度（凌星前置判定原料——proj[2] 在行星投影处会被覆写，先存；
         // 恒星不可见=NaN 同扇区判非凌星（starSx.isNaN() 既有门在前））
         val starDepthR340 = if (starVis) proj[2] else Float.NaN
+        // R399 count 轴微点基座：微星三档深度语言同源（<900/<2600/远——域内系统
+        // 恒 tier0，远档并入光晕读法=与星点同屏亮度族）
+        val microTierA = MICRO_TIER_A[if (distStar < 900f) 0 else if (distStar < 2600f) 1 else 2]
+        var formOn = true // R399：a≤0 段（浮现坡道后段）重层截断——微点腿续走不整吞
         for (i in 0 until maxShow) {
             val p = planets[i]
             // R328 成型档坡道（镜像 Canvas——rampW 成型态=放缓/非成型=APPEAR_RAMP 逐位等值）
             val a = TasteTagPlanets.appearAlpha(ratio, i, maxShow, rampW)
-            if (a <= 0f) break
+            if (a <= 0f) formOn = false // R399：off 段重层截断（阈值单调）；旧 break 整吞退役
             val rW = planetOrbitRadius(p, s.bodyR)
             val peri = TasteTagPlanets.keplerPeriapsis(p)
             // ---- 宜居带环带（R311 重做：纯色描边圆 → 尘埃/冰粒环带——用户批准）：
             //      均迹线=极淡 KEPLER 线（保轨道可读）+冰粒=KEPLER 点（ν 角+径向
             //      系数+尺寸+逐粒 alpha 装填——GPU 轨道求值既有件，装配纯浮点拷贝；
             //      聚块成弧成缝=TasteStarColor 三段谐波场，alpha<0.10 整粒跳过=环缝） ----
-            if (i < TasteTagPlanets.LOD_MID_PLANETS || orbitBoost > 0.5f) {
+            // （R399：off 段重层不画——微点腿不进轨道线/宜居带）
+            if (formOn && (i < TasteTagPlanets.LOD_MID_PLANETS || orbitBoost > 0.5f)) {
                 val sysIdx = addKepSys(scx, scy, scz, peri, incSin, incCos, rW, p.ecc)
                 if (sysIdx >= 0) {
                     // 均迹线（极淡 0.045——旧 (0.10+0.08·boost) 纯色圆圈退役）
@@ -3858,22 +4036,46 @@ internal class GlFrameBuilder {
             if (TasteSpace.project(mpos[0], mpos[1], mpos[2], cam, focal, cx, cy, proj, basisArr)) {
                 val worldR = planetWorldRadius(p, s.bodyR, rW)
                 val rP = worldR * proj[3]
-                if (rP >= 1.5f &&
-                    proj[0] > -rP * 3f && proj[0] < w + rP * 3f && proj[1] > -rP * 3f && proj[1] < h + rP * 3f
-                ) {
-                    // R340 凌星前置判定（黑圈回归根治）：加「行星在恒星与相机之间」深度门——
-                    // 背后掩星行星不再进剪影档（走受光路径，GL 深度测试被恒星球真遮挡）；
-                    // 真前+屏面重叠=金星凌日观感保真。恒星出屏（starSx NaN/depth NaN）=非凌星。
-                    val transiting = !starSx.isNaN() &&
-                        EclipseFx.isTransitingFront(
-                            rP, starPx, hypot(proj[0] - starSx, proj[1] - starSy),
-                            proj[2], starDepthR340,
+                // R340 凌星前置判定（黑圈回归根治）：加「行星在恒星与相机之间」深度门——
+                // 背后掩星行星不再进剪影档（走受光路径，GL 深度测试被恒星球真遮挡）；
+                // 真前+屏面重叠=金星凌日观感保真。恒星出屏（starSx NaN/depth NaN）=非凌星。
+                // （R399 外提自 rP 门——微点腿同门剪影读法；判定式零改）
+                val transiting = !starSx.isNaN() &&
+                    EclipseFx.isTransitingFront(
+                        rP, starPx, hypot(proj[0] - starSx, proj[1] - starSy),
+                        proj[2], starDepthR340,
+                    )
+                // ---- R399 count 轴微点腿：「未浮现」态（a<1——坡道淡出中/off）=
+                //      行星色微点×(1−a) 镜像淡入（R349 blend 带双态叠加同族语言，
+                //      count 轴交接零跳变）；凌星中=暗微点（背影剪影的亚像素读法
+                //      同门）——行星永不整吞（判词 r399_notes §2） ----
+                val dotA = TasteTagPlanets.microDotAlpha01(ratio, i, maxShow, rampW) * microTierA
+                if (dotA > 0.01f) {
+                    if (transiting) {
+                        addPoint(proj[0], proj[1], lodMicroDotPx, 0.75f, 0.03f, 0.04f, 0.06f, dotA * 0.94f)
+                    } else {
+                        val dotColor = TasteStarColor.planetColorOf(p.compV, p.compP, p.compA, s.bodyColor, p.tag.hashCode())
+                        addPoint(
+                            proj[0], proj[1], lodMicroDotPx, 0.75f,
+                            ((dotColor shr 16) and 0xFF) / 255f, ((dotColor shr 8) and 0xFF) / 255f,
+                            (dotColor and 0xFF) / 255f, dotA,
                         )
+                    }
+                    statPlanetDots++
+                }
+                // ---- R399 画不出门退役：rP>0 即入装填（旧 1.5px 裸像素门=亚像素
+                //      行星连点腿都不给=隐身缝；亚像素由 buildPlanetBody 点腿尺寸
+                //      地板兜底=最小可见亮点）；屏界裕量=微点地板口径 ----
+                val edgeM = (rP * 3f).coerceAtLeast(lodMicroDotPx)
+                if (formOn && rP > 0f &&
+                    proj[0] > -edgeM && proj[0] < w + edgeM && proj[1] > -edgeM && proj[1] < h + edgeM
+                ) {
                     buildPlanetBody(s, p, proj[0], proj[1], mpos[0], mpos[1], mpos[2], worldR, rP, a, scx, scy, scz, t, inc, transiting)
                 }
             }
             // ---- 尘埃环（KEPLER 尘点 GPU 求值；近档前景粒=岩石真身） ----
-            if (dustA > 0f) {
+            // （R399：off 段尘埃不画——重层截断同 break 旧语义）
+            if (formOn && dustA > 0f) {
                 val items = entry.items
                 GlPalette.hsvOf(s.bodyColor, hsv)
                 hsv[2] = maxOf(hsv[2], 0.85f)
@@ -3942,6 +4144,79 @@ internal class GlFrameBuilder {
     }
 
     /**
+     * R399 远档行星微点档（ratio≥[TasteTagPlanets.APPEAR_RATIO] 的「未浮现」态——
+     * 旧整系统 return 吞门退役）：**并入母星光晕的行星色微点**（真开普勒屏位
+     * 开普勒链零改——与域内装配同一式单源）；亮度=微星三档深度语言（远档=dim
+     * 并入光晕读法）；top [LOD_MID_PLANETS] 帽=远档微点与中距 top 集同拍（点预算
+     * 纪律：全场系统×K 有界）；深位行星在坡道窗内退场（域内微点=1 的连续收口
+     * =门边界零跳变——[TasteTagPlanets.microDotAlpha01] 单源）。
+     * **重层全灭照旧**（轨道线/宜居带/尘埃/球身——降级本身省 draw，性能刀收益
+     * 零回退）；凌星链零碰（远档零食深判定——预扫同门本就不及此域）。
+     */
+    private fun buildPlanetMicroDotsR399(
+        s: dev.tgfeed.ui.TasteFxStar,
+        entry: dev.tgfeed.ui.TastePlanetEntry,
+        cam: TasteSpace.SpaceCam,
+        focal: Float,
+        t: Float,
+        w: Float,
+        h: Float,
+        cx: Float,
+        cy: Float,
+        scx: Float, scy: Float, scz: Float,
+        ratio: Float,
+    ) {
+        val planets = entry.system.planets
+        val maxShow = min(planets.size, TasteTagPlanets.LOD_NEAR_PLANETS)
+        if (maxShow <= 0) return
+        val distStar = TasteSpace.distTo(cam, scx, scy, scz)
+        if (distStar <= TasteSpace.NEAR) return
+        val sizeK = focal / distStar
+        val starPxRaw = s.bodyR * sizeK
+        val starPxMax = minOf(w, h) * TasteSpace.SWALLOW_MAX_R_FRAC
+        if (starPxRaw > starPxMax * 3f) return // 深吞没早退（与域内同款——本域实际不可达，诚实门）
+        // 恒星屏位（点云锚）：出屏（近裁后/屏界外）即整系统微点免单
+        if (!TasteSpace.project(scx, scy, scz, cam, focal, cx, cy, proj, basisArr)) return
+        val starSx = proj[0]
+        val starSy = proj[1]
+        // 屏界裕量=星点云半径（微点并入母星光晕=行星簇与星同屏同界）
+        val edgeM = (starPxRaw * 5.5f).coerceAtLeast(lodMicroDotPx)
+        if (starSx < -edgeM || starSx > w + edgeM || starSy < -edgeM || starSy > h + edgeM) return
+        // R328 成型档坡道参（与域内同拍——深位退场窗随成型态放缓）
+        val rampW = if (s.birth?.planetsForming == true) {
+            TasteBirthFx.formingRampWidth(TasteTagPlanets.APPEAR_RAMP)
+        } else {
+            TasteTagPlanets.APPEAR_RAMP
+        }
+        val microTierA = MICRO_TIER_A[if (distStar < 900f) 0 else if (distStar < 2600f) 1 else 2]
+        val seed = (s.chatId % 100_000L).toInt()
+        val inc = galaxyOrbitInclination(seed)
+        // 坡道窗内深位行星退场途中=全量评值；窗外只扫 top-K（点预算纪律）
+        val n = if (ratio < TasteTagPlanets.APPEAR_RATIO + rampW) maxShow
+        else min(maxShow, TasteTagPlanets.LOD_MID_PLANETS)
+        for (i in 0 until n) {
+            val p = planets[i]
+            val da = TasteTagPlanets.microDotAlpha01(ratio, i, maxShow, rampW)
+            if (da <= 0.01f) continue
+            val rW = planetOrbitRadius(p, s.bodyR)
+            val peri = TasteTagPlanets.keplerPeriapsis(p)
+            val nu = TasteTagPlanets.keplerTheta(p, t)
+            val rOrb = TasteTagPlanets.keplerOrbitRadius(p, rW, nu)
+            planetOrbitPoint(scx, scy, scz, rOrb, nu + peri, inc, mpos)
+            if (!TasteSpace.project(mpos[0], mpos[1], mpos[2], cam, focal, cx, cy, proj, basisArr)) continue
+            if (proj[0] < -edgeM || proj[0] > w + edgeM || proj[1] < -edgeM || proj[1] > h + edgeM) continue
+            // 微点=行星色单源（与球身同色——与恒星光晕可区分）；尺寸=微点地板
+            val dotColor = TasteStarColor.planetColorOf(p.compV, p.compP, p.compA, s.bodyColor, p.tag.hashCode())
+            addPoint(
+                proj[0], proj[1], lodMicroDotPx, 0.75f,
+                ((dotColor shr 16) and 0xFF) / 255f, ((dotColor shr 8) and 0xFF) / 255f,
+                (dotColor and 0xFF) / 255f, microTierA * da,
+            )
+            statPlanetDots++
+        }
+    }
+
+    /**
      * 行星真球实例装填（任务①——planetBitmapOf 六件套位图整体退役）：
      * 光向=行星→恒星归一世界向量（真相位的光源）；土星环=真 3D 环带 op
      * （倾角=系统倾角+哈希自倾，深度缓冲与母球真穿插）；气态/岩质=程序表面
@@ -3971,11 +4246,13 @@ internal class GlFrameBuilder {
         val k = TasteLodPolicy.blend01(rP, lodSolidFloorPx, lodPointCeilPx)
         if (k < 0.99f) {
             // 点形态（blend 带内 ×(1−k) 淡出；R320 凌星档=暗点——背影剪影的
-            // 亚像素读法）
+            // 亚像素读法）；R399 尺寸地板=max(rP×2, 微点地板)——亚像素行星
+            // =最小可见亮点不蒸发（「画不出门」退役的形态轴兜底）
+            val dotSize = (rP * 2f).coerceAtLeast(lodMicroDotPx)
             if (transiting) {
-                addPoint(psx, psy, rP * 2f, 0.75f, 0.03f, 0.04f, 0.06f, appear * 0.94f * (1f - k))
+                addPoint(psx, psy, dotSize, 0.75f, 0.03f, 0.04f, 0.06f, appear * 0.94f * (1f - k))
             } else {
-                addPoint(psx, psy, rP * 2f, 0.75f, pr, pg, pb, appear * 0.9f * (1f - k))
+                addPoint(psx, psy, dotSize, 0.75f, pr, pg, pb, appear * 0.9f * (1f - k))
             }
         }
         if (k > 0.01f) {
@@ -4263,7 +4540,10 @@ internal class GlFrameBuilder {
         if (rockCount > batchStart) emitImmediate(OP_ROCK, batchStart, rockCount - batchStart, 0)
     }
 
-    /** 体积星云实例装填（NEB_STRIDE 语义见 companion） */
+    /**
+     * 体积星云实例装填（NEB_STRIDE 语义见 companion；**槽 9 频率标度恒 1f**
+     * ——R388 刀2 雾族行既有基因恒等：本批病灶=复合体行，雾族远档形态另案）
+     */
     private fun addNebula(sx: Float, sy: Float, halfPx: Float, seed: Float, t: Float, r: Float, g: Float, b: Float, a: Float) {
         if (nebCount >= MAX_NEBULAS) return
         val i = nebCount * NEB_STRIDE
@@ -4271,6 +4551,7 @@ internal class GlFrameBuilder {
         nebBuf[i + 3] = seed; nebBuf[i + 4] = t
         nebBuf[i + 5] = r; nebBuf[i + 6] = g; nebBuf[i + 7] = b
         nebBuf[i + 8] = a.coerceIn(0f, 1f)
+        nebBuf[i + 9] = 1f // R388 刀2：雾族行频率标度恒 1（uFreqScale=1=既有基因）
         emitImmediate(OP_NEBULA, nebCount, 0, 0)
         nebCount++
     }
@@ -4280,15 +4561,21 @@ internal class GlFrameBuilder {
      * 槽后段**：opA=MAX_NEBULAS+序号，TasteGlRenderer OP_NEBULA 回放按 opA×
      * NEB_STRIDE 寻址零改动即通吃两行；独立计数 [nebCpxCount] 帽
      * [MAX_NEBULA_CPX]=16——雾行 24 帽零挤压（复合体先画在雾前也不抢雾的槽：
-     * 两行分段计数=画家序与预算序解耦）。
+     * 两行分段计数=画家序与预算序解耦）。R388 刀2：[freqScale]=丝缕频率标度
+     * （槽 9→uFreqScale——clamp 值由调用方单源算好传入，本口只装填零第二份
+     * 判定）。
      */
-    private fun addNebulaCpx(sx: Float, sy: Float, halfPx: Float, seed: Float, t: Float, r: Float, g: Float, b: Float, a: Float) {
+    private fun addNebulaCpx(
+        sx: Float, sy: Float, halfPx: Float, seed: Float, t: Float,
+        r: Float, g: Float, b: Float, a: Float, freqScale: Float,
+    ) {
         if (nebCpxCount >= MAX_NEBULA_CPX) return
         val i = (MAX_NEBULAS + nebCpxCount) * NEB_STRIDE
         nebBuf[i] = sx; nebBuf[i + 1] = sy; nebBuf[i + 2] = halfPx
         nebBuf[i + 3] = seed; nebBuf[i + 4] = t
         nebBuf[i + 5] = r; nebBuf[i + 6] = g; nebBuf[i + 7] = b
         nebBuf[i + 8] = a.coerceIn(0f, 1f)
+        nebBuf[i + 9] = freqScale // R388 刀2：丝缕频率标度（1=既有设计基因原样）
         emitImmediate(OP_NEBULA, MAX_NEBULAS + nebCpxCount, 0, 0)
         nebCpxCount++
     }

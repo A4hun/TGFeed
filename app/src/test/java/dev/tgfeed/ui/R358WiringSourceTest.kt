@@ -13,13 +13,15 @@ import java.io.File
  *    拍板方案 A「语义雾质感革命」——R252「均匀大圆片+高 alpha」禁区由「形态
  *    丝缕化+带上限」双守：带上界 0.16 ≪ 旧病 0.26；KDoc 量级史+诚实量级自认
  *    在案——真实星云肉眼不可见，本档为梦幻感可读性优先的压缩）；
- *  - **结构锚②NEBULA_FS 四件在场**：脊线 fbm 丝缕层（峰值 alpha 只落纤维丝）/
- *    种子哈希方向角各向异性拉伸（约 1.8:1，零新参数件）/暗尘埃带减法剪影/
- *    雾心色温分层（零新色源——色相仍 uColor 单源）；
+ *  - **结构锚②NEBULA_FS 四件在场**：脊线噪声丝缕层（峰值 alpha 只落纤维丝；
+ *    R392 判词①翻新——构造基因逐字保留，载体由 fbm3 ALU 换 fieldAt 烘焙体
+ *    采样）/种子哈希方向角各向异性拉伸（约 1.8:1，零新参数件）/暗尘埃带减法
+ *    剪影/雾心色温分层（零新色源——色相仍 uColor 单源）；
  *  - **反锚③语义件零改**：FOG_FADE_NEAR/FAR 渐散原值、EMISSION_ALPHA_MULT=1.6
- *    与 emissionAlphaOf 结构原样（发射分化单源）、NEBULA_FS highp 守档（R357
- *    勿动）+径向 falloff 与 discard 仍走原 d（弥散保义——絮化≠锐化）+零新
- *    uniform（零新参数件）；
+ *    与 emissionAlphaOf 结构原样（发射分化单源）、NEBULA_FS 精度=R392 判词③
+ *    回归 mediump（载体=纹理后 R357 highp 病因消亡；uSeed/uTime 显式 highp
+ *    保留）+径向 falloff 与 discard 仍走原 d（弥散保义——絮化≠锐化）+零新
+ *    参数 uniform（uNoiseVol 第六件=R392 载体非参数件）；
  *  - **联动锚④发射帽=2×雾帽单源**：防「发射档被帽钳到普通档之下」语义倒挂
  *    （R323 K②「发射=更亮」+r358_notes §2.2「链不变联动到约 0.21」——帽守
  *    旧值 0.10 会在雾帽 0.13 档造成倒挂，故帽随雾帽联动，判据/乘子零改）。
@@ -81,10 +83,11 @@ class R358WiringSourceTest {
     @Test
     fun `结构-星云着色器丝缕拉伸暗带色分层四件在场`() {
         val fs = nebulaFsBody(glShaders())
-        // ① 丝缕层：脊线 fbm（1-abs(2*fbm-1) 脊线噪声天然产纤维脉络）+max 合成走既有门
+        // ① 丝缕层：脊线噪声（1-abs(2*n-1) 脊线天然产纤维脉络）+max 合成走既有门
+        //（R392 判词①：构造基因字面原样，载体=fieldAt 烘焙体采样）
         assertTrue(
-            "丝缕层脊线 fbm 必须在场（ridge=1-abs(2*fbm3(q*2.3+warp*1.1)-1)）",
-            fs.contains("float ridge = 1.0 - abs(2.0 * fbm3(q * 2.3 + warp * 1.1) - 1.0);"),
+            "丝缕层脊线噪声必须在场（ridge=1-abs(2*fieldAt(q*2.3+warp*1.1)-1)——R392 载体）",
+            fs.contains("float ridge = 1.0 - abs(2.0 * fieldAt(q * 2.3 + warp * 1.1) - 1.0);"),
         )
         assertTrue(
             "密度合成 d2=max(den, ridge*0.85) 必须在场（峰值 alpha 只落纤维丝）",
@@ -125,17 +128,29 @@ class R358WiringSourceTest {
             ef.contains("(fogAlpha * EMISSION_ALPHA_MULT).coerceAtMost(EMISSION_ALPHA_CAP)"),
         )
         val fs = nebulaFsBody(glShaders())
-        // R357 精度守档（fp16 塌噪声实锤——勿动）
-        assertTrue("NEBULA_FS 须守 precision highp float（R357）", fs.contains("precision highp float;"))
+        // R392 判词③翻新：精度回归 mediump（噪声载体=烘焙纹理 8bit 归一化采样后，
+        // R357 highp 病因——hash3 中间积 fp16 溢出——随载体消亡；uSeed/uTime 显式
+        // highp 保留=种子派生角/时漂精度件）——R357 精神的兑现而非翻转
+        assertTrue(
+            "NEBULA_FS 精度回归 mediump（R392 判词③——R357 highp 病因随载体消亡）",
+            fs.contains("precision mediump float;"),
+        )
+        assertTrue(
+            "uSeed/uTime 显式 highp 保留（种子派生角/时漂精度件）",
+            fs.contains("uniform highp float uSeed;") && fs.contains("uniform highp float uTime;"),
+        )
         // 弥散保义：径向 falloff 与 discard 边界仍走原 d（边缘零锐化）
         assertTrue(
             "径向 falloff 原 d 原样（弥散保义——絮化≠锐化）",
             fs.contains("float fall = 1.0 - smoothstep(0.12, 1.0, d);"),
         )
         assertTrue("discard 圆界原 d 原样", fs.contains("if (d > 1.0) discard;"))
-        // 零新 uniform（零新参数件——种子即方向）
+        // 第五件（R388 刀2 翻新保义：uFreqScale 频率标度=维护性扩展——「丝缕基因
+        // 的尺度变换非基因改变」：q.xy 系数标度=同一噪声场 zoom，z=种子身份槽不动；
+        // 默认 1.0=四件基因恒等零新参数语义）；第六件（R392 判词①：uNoiseVol
+        // sampler=烘焙 3D 噪声体——载体件非参数件，五浮点基因零增益）
         val uniformCount = Regex("uniform\\s").findAll(fs).count()
-        assertEquals("NEBULA_FS uniform 仍=uColor/uAlpha/uSeed/uTime 四件（零新参数件）", 4, uniformCount)
+        assertEquals("NEBULA_FS uniform 六件=uColor/uAlpha/uSeed/uTime/uFreqScale 五浮点+uNoiseVol sampler（R392 噪声载体——烘焙 3D 纹理）", 6, uniformCount)
         // 彩虹禁令不犯：零 hue(t) 族（色相循环绝迹）
         assertFalse("零随时间色相循环（禁令 12）", Regex("hue|hsv", RegexOption.IGNORE_CASE).containsMatchIn(fs))
     }

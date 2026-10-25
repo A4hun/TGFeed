@@ -12,7 +12,7 @@ import java.nio.ByteOrder
  * ```
  * 场景层（全部 op 回放）→ sceneFbo（RGBA8 纹理 + 深度纹理 R383）
  *   → [R383 体积趟（贴脸窗激活才跑——挂位=blur 前）：
- *      raymarch 半/quarter FBO（深度纹理逐样本遮挡裁剪）
+ *      raymarch 半/quarter FBO（深度纹理逐样本遮挡裁剪；raymarch 噪声=单元 2 常驻 3D 体（R392））
  *      → 深度感知合成 sceneFbo→sceneFbo2（premultiplied over）
  *      → front 换装 sceneTex2（ping-pong）+深度附件 invalidate（体积趟已消费）]
  *   → quarter 横向模糊+亮部提取合趟（blurA——Mali 税收口：FBO 切换 6→3，
@@ -97,6 +97,9 @@ internal class GlPostFx {
     private var uTimeRay = -1
     private var uStepsRay = -1
 
+    /** R392 噪声体 sampler 位（单元 2 常驻单源=TasteGlRenderer——本类只指派不绑定） */
+    private var uNoiseVolRay = -1
+
     // R383 体积合成 uniform 位
     private var uSceneVolComp = -1
     private var uVolumeVolComp = -1
@@ -111,8 +114,13 @@ internal class GlPostFx {
     /** bloom 亮部软阈值（亮度 0.70~0.95 带——亮星核/光子环/吸积盘内缘/受光高光溢出） */
     private val bloomThreshold = 0.70f
 
-    /** 建成（onSurfaceCreated 调用——旧句柄先释放） */
-    fun recreate() {
+    /**
+     * 建成（onSurfaceCreated 调用——旧句柄先释放）。
+     * R392：[noiseVolTex]=渲染器烘焙上传的 3D 噪声体句柄——**纹理绑定本体不重复**
+     * （单元 2 常驻单源=TasteGlRenderer），本类只把 progRay 的 uNoiseVol sampler
+     * 指派到单元 2；调用点必须排在渲染器噪声体上传之后（EGL 重建=全链重走）。
+     */
+    fun recreate(noiseVolTex: Int) {
         release()
         progBlur = GlShaders.buildProgram(GlShaders.POST_VS, GlShaders.BLUR_FS)
         progComposite = GlShaders.buildProgram(GlShaders.POST_VS, GlShaders.COMPOSITE_FS)
@@ -144,6 +152,12 @@ internal class GlPostFx {
         uSeedRay = GLES30.glGetUniformLocation(progRay, "uSeed")
         uTimeRay = GLES30.glGetUniformLocation(progRay, "uTime")
         uStepsRay = GLES30.glGetUniformLocation(progRay, "uSteps")
+        uNoiseVolRay = GLES30.glGetUniformLocation(progRay, "uNoiseVol")
+        // R392：噪声体绑定本体不重复（noiseVolTex 已由 TasteGlRenderer 常驻单元 2）——
+        // 此处只指派 sampler；帧路径零新调用
+        GLES30.glUseProgram(progRay)
+        GLES30.glUniform1i(uNoiseVolRay, 2)
+        GLES30.glUseProgram(0)
         uSceneVolComp = GLES30.glGetUniformLocation(progVolComp, "uScene")
         uVolumeVolComp = GLES30.glGetUniformLocation(progVolComp, "uVolume")
         // 全屏三角形（[-1,-1]/[3,-1]/[-1,3]）

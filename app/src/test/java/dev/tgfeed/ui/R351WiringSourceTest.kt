@@ -21,8 +21,10 @@ import java.io.File
  *  - **发射块零碰锚**：R323 发射星云块 verbatim（亮档 emissionAlphaOf(a) else a/
  *    电离侧辉偏置/星胚三单口/scanEmissionFogsR323/fogPulse——本批 blob 循环
  *    只动两型共用层绘制段，发射分化语义零回破）；
- *  - **零着色器锚**：NEBULA_VS/NEBULA_FS 零改动（块内丝缕结构=NEBULA_FS 既有
- *    fbm 密度场原样承担——絮化≠锐化红线；零新程序零新纹理零新 uniform）；
+ *  - **零着色器锚**：絮化不进 shader（NEBULA_VS 两 uniform 原样+零 floc/blob
+ *    uniform——絮化≠锐化红线；块内丝缕结构=NEBULA_FS 密度场承担。**R392 注记**：
+ *    噪声载体革命（判词①）属另批——密度场载体由逐像素 ALU fbm3 换烘焙 3D 纹理
+ *    fieldAt 采样+uNoiseVol 第六件 uniform，构造基因字面全保，与本批判词无涉）；
  *  - **帧零分配锚**：floc 暂存两枚（flocAlphaPack/flocOff）为预分配字段非局部
  *    ——blob 装配帧路径零分配纪律。
  */
@@ -188,7 +190,7 @@ class R351WiringSourceTest {
     // ==================== 零着色器锚（絮化不进 shader——絮化≠锐化） ====================
 
     @Test
-    fun `零着色器锚-NEBULA 程序零改动（零新 uniform 零新纹理）`() {
+    fun `零着色器锚-絮化不进shader（NEBULA程序零floc件——R392载体革命属另批）`() {
         val s = shaders()
         // NEBULA_VS 既有两 uniform 原样（blob 错位在装配层 CPU 侧一次求值——
         // VS 顶点扰动方案已否决：quad 仅 4 顶点 6 索引，扰动只能扭四角）
@@ -205,15 +207,17 @@ class R351WiringSourceTest {
             "NEBULA 程序不得新增 floc/blob uniform（零着色器改动红线）",
             !Regex("uFloc|uBlob").containsMatchIn(s),
         )
-        // NEBULA_FS 既有结构原样：d>1 先 discard（片元账∝quad 面积）+域扭曲 fbm 密度场
-        //（块内丝缕结构既有承担——絮化只拆块不锐化，弥散语义红线）
+        // NEBULA_FS 既有结构原样：d>1 先 discard（片元账∝quad 面积）+域扭曲噪声
+        // 密度场（块内丝缕结构既有承担——絮化只拆块不锐化，弥散语义红线。
+        // R392 判词①翻新：密度场构造基因（域扭曲 q+warp×1.4 配比）逐字保留，
+        // 载体由逐像素 ALU fbm3 换烘焙 3D 纹理 fieldAt 采样——锚随载体换字面）
         assertTrue(
             "NEBULA_FS d>1 discard 先行丢失（片元账口径）",
             Regex("if \\(d > 1\\.0\\) discard;").containsMatchIn(s),
         )
         assertTrue(
-            "NEBULA_FS 域扭曲 fbm 密度场丢失（块内丝缕 R281 既有）",
-            Regex("fbm3\\(q \\+ warp \\* 1\\.4").containsMatchIn(s),
+            "NEBULA_FS 域扭曲噪声密度场丢失（块内丝缕 R281 既有——R392 载体=fieldAt 烘焙体采样）",
+            Regex("fieldAt\\(q \\+ warp \\* 1\\.4").containsMatchIn(s),
         )
     }
 

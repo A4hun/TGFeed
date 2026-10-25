@@ -443,7 +443,7 @@ void main() {
 uniform mat4 uVP;
 """
 
-    /** 3D 值噪声族（PLANET/RING/ROCK/NEBULA/STRIP 共用段——与真球 hash3 同式）。R357：消费 FS 全 highp 化（fp16 塌噪声实锤——精度档=纹理存亡） */
+    /** 3D 值噪声族（PLANET/RING/ROCK/NEBULA/STRIP 共用段——与真球 hash3 同式）。R357：消费 FS 全 highp 化（fp16 塌噪声实锤——精度档=纹理存亡）。R392：NEBULA/RAYMARCH 两域摘除（噪声载体=烘焙 3D 纹理），存活消费者=PLANET_FS */
     private const val NOISE_3D = """
 float hash3(vec3 p) {
     p = fract(p * 0.3183099 + vec3(0.1, 0.17, 0.13));
@@ -979,38 +979,73 @@ void main() {
      *     单源（类别色/发射亮档色 R323 零改，零新色源）。
      * 弥散保义红线：边缘仍=既有径向 falloff（d 未受拉伸——絮化≠锐化 R351 口径
      * 沿用）；语义件（渐散/双层视差/絮化/发射分化）全在装配层零改。
-     * R357：precision highp 守档勿动（fp16 塌噪声实锤——精度=纹理存亡）。
+     * R357：precision highp 守档（fp16 塌噪声实锤——精度=纹理存亡）。**R392 起
+     * 翻篇**：噪声载体=烘焙纹理后 highp 病因消亡，本 FS 回归 mediump（判词③，
+     * 详见下段 R392 注记——R357 精神的兑现而非翻转）。
+     *
+     * **R388 刀2 丝缕频率锁定**（用户 2026-10-25 14:1x 裁决根治刀——判词「丝缕
+     * 基因的尺度变换非基因改变」）：第五件 uniform `uFreqScale`（**默认 1.0=
+     * 既有设计基因原样**）——q.xy 系数标度=**同一噪声场的 zoom**（z=种子身份槽
+     * 不动=同一云同一丝缕身份，非换基因；`vec3(st*2.1, uSeed)` 构造行字面零碰）
+     * ：装配端 scale=clamp(rPx/REF, floor, 1.0)——远（小 quad）→低频→**粗丝
+     * 留空大**（任何屏距丝缕像素宽恒定），近（大 quad）→scale=1 既有基因；
+     * R358 判词「丝间留空看得见底星」在远距由恒定丝宽真正成立。**稀疏化配套**
+     * （可配套项落地）：alpha 门下沿随标度抬升 gateLo=0.40+0.24·(1−scale)
+     * （远档只留最亮数缕）；scale=1 位移零=R358 门基因（0.40..0.82）恒等。
+     * 雾族行恒 1.0（本批病灶=复合体行——雾族远档形态另案）。
+     *
+     * **R392 载体革命（r392_notes §2①判词）**：噪声**构造**（4 次采样配比/域扭曲/
+     * 脊线/暗带/门/色温分层/各向异性/freqScale/时漂平移）逐字保留，**载体**由逐像素
+     * ALU fbm3 换烘焙 3D 纹理单次采样（uNoiseVol——渲染器常驻单元 2 单源）；上记
+     * R357 highp 守档判词随载体消亡（噪声值=纹理 8bit 归一化，mediump 采样天然
+     * 够用——§2③），FS 默认精度回归 mediump（uSeed/uTime 显式 highp 保留）。
      */
     const val NEBULA_FS = """#version 300 es
-precision highp float;
+precision mediump float;
 in vec2 vLocal;
 uniform vec3 uColor;
 uniform float uAlpha;
-uniform float uSeed;
-uniform float uTime;
+uniform highp float uSeed;
+uniform highp float uTime;
+uniform float uFreqScale;
+uniform mediump sampler3D uNoiseVol; // R392 噪声载体革命：烘焙 3D 噪声体（逐像素 ALU 求值退役）
 out vec4 fragColor;
-$NOISE_3D
+// R392 载体函数：烘焙体采样（窗 16 q 单位周期——REPEAT 平铺无缝；0.0625=1/16
+// 与 NoiseVolumeBaker.WINDOW 单源对表）；种子=平移窗（原 z=uSeed 切片语义的
+// 载体内等价身份映射——场统计基因不变）
+float fieldAt(highp vec3 p) {
+    highp vec3 so = fract(vec3(uSeed * 0.1031, uSeed * 0.173, uSeed * 0.3113));
+    return texture(uNoiseVol, p * 0.0625 + so).r;
+}
 void main() {
     float d = length(vLocal);
     if (d > 1.0) discard;
     float fall = 1.0 - smoothstep(0.12, 1.0, d);
     // R358 ②各向异性拉伸：种子哈希固定方向角（黄金比例哈希——零新参数件，
     // 种子即方向），旋转矩阵两行后短轴压缩 1.8 = 雾沿 ang 向拉长（约 1.8:1）
-    float ang = fract(uSeed * 0.6180339887) * 3.14159265;
+    highp float ang = fract(uSeed * 0.6180339887) * 3.14159265;
     float ca = cos(ang);
     float sa = sin(ang);
     vec2 st = vec2(ca * vLocal.x - sa * vLocal.y, sa * vLocal.x + ca * vLocal.y);
     st.y *= 1.8;
     vec3 q = vec3(st * 2.1, uSeed);
+    // R388 刀2 频率锁定：q.xy 系数标度=同一噪声场 zoom（尺度变换非基因改变——
+    // 丝缕噪声频率×scale：远小 quad 低频=粗丝留空大、丝缕像素宽恒定；
+    // warp/den/ridge 全域随 zoom 一致缩放=图案级尺度变换）
+    q.xy *= uFreqScale;
     vec3 warp = vec3(
-        fbm3(q + vec3(0.0, uTime * 0.013, 0.0)),
-        fbm3(q + vec3(5.2, 1.3, -uTime * 0.011)),
+        fieldAt(q + vec3(0.0, uTime * 0.013, 0.0)),
+        fieldAt(q + vec3(5.2, 1.3, -uTime * 0.011)),
         0.0);
-    float den = fbm3(q + warp * 1.4 + vec3(0.0, 0.0, uTime * 0.017));
-    // R358 ①丝缕层：脊线 fbm 天然产纤维脉络（峰值 alpha 只落在纤维丝上）
-    float ridge = 1.0 - abs(2.0 * fbm3(q * 2.3 + warp * 1.1) - 1.0);
+    float den = fieldAt(q + warp * 1.4 + vec3(0.0, 0.0, uTime * 0.017));
+    // R358 ①丝缕层：脊线噪声天然产纤维脉络（峰值 alpha 只落在纤维丝上）
+    float ridge = 1.0 - abs(2.0 * fieldAt(q * 2.3 + warp * 1.1) - 1.0);
     float d2 = max(den, ridge * 0.85);
-    float a = smoothstep(0.40, 0.82, d2) * fall * uAlpha;
+    // R388 刀2 稀疏化配套：远档（scale<1）alpha 门下沿随标度抬升（0.40→0.40+
+    // 0.24·(1−scale)=floor 档 0.556——只留最亮数缕，稀粗丝观感的对比半边）；
+    // scale=1 位移零=R358 门基因 0.40 恒等（家族对表在两半边共在窗恒等成立）
+    float gateLo = 0.40 + 0.24 * (1.0 - uFreqScale);
+    float a = smoothstep(gateLo, 0.82, d2) * fall * uAlpha;
     // R358 ③暗尘埃带：纤维亮脊旁刻暗缝（减法式剪影——雾体内部结构，零新绘制层）
     float lane = smoothstep(0.62, 0.88, ridge) * (1.0 - den);
     a *= 1.0 - 0.55 * lane;
@@ -1105,13 +1140,17 @@ void main() {
 
     /**
      * R383 深空复合体 raymarch 体积趟 FS（半/quarter 分辨率 FBO——步数分档 uniform）。
-     * **精度 R357 纪律：precision highp float 全程**（噪声消费 FS 类闸成员——hash3
-     * 中间积约 25 万在 fp16 溢出塌噪声，精度档=纹理存亡）。
-     * 密度=**NEBULA_FS 同族 fbm3**（$NOISE_3D 单源共享——hash3/vnoise3/fbm3 与
-     * NEBULA_FS 逐字同源；家族数值基因 2.1 与 0.12,1.0 与 0.40,0.82 与 0.85 与
-     * 0.62,0.88 与 0.55 与 0.70,1.05 由 R383WiringSourceTest 常量对表锚锁定——
-     * NEBULA_FS 文本零碰红线所迫，单源锁在测试侧，两文件任一侧漂移即红）×径向
-     * falloff×层调制（低频壳场 fbm3 0.55..1.0——§4.2 层结构体积化）。
+     * **精度 R392 判词③：precision highp float 保留**——保留理由已从 R357 的噪声
+     * ALU（hash3 中间积约 25 万在 fp16 溢出塌噪声，彼时精度档=纹理存亡）换为
+     * **射线几何/深度比较**（光线重建/球交/uVP 深度裁剪需 fp32，与噪声无关）；
+     * 噪声值改由 uNoiseVol 烘焙体采样（8bit 归一化，mediump 采样天然够用）。
+     * 密度=**NEBULA_FS 同族噪声场**（**R392 载体革命**：噪声载体=NoiseVolumeBaker
+     * 烘焙 64³ 3D 纹理，两 FS 各以 fieldAt 单源采样同一纹理单件；构造基因
+     * （2.1 与 0.12,1.0 与 0.40,0.82 与 0.85 与 0.62,0.88 与 0.55 与 0.70,1.05）
+     * 两半边对表仍在，由 R383WiringSourceTest 常量对表锚锁定——NEBULA_FS 文本
+     * 零碰红线所迫，单源锁在测试侧，两文件任一侧漂移即红；**载体不再逐字共享**
+     * ——$NOISE_3D GLSL 噪声库从本块摘除，逐像素 ALU 求值退役）×径向
+     * falloff×层调制（低频壳场 0.55..1.0——§4.2 层结构体积化）。
      * 累积=前向背面离散合成：自辉 acc+消光 τ（每步 aStep=dens×ds×σ；σ=−ln(1−
      * uAlpha)×0.5 标定=**穿心直径满密度积分 α 恰=uAlpha——等效帽 §4.3 结构性
      * 成立**，uAlpha 装配侧已含 crossfade 权与 ramp）。抖动=ign interleave
@@ -1143,7 +1182,14 @@ uniform float uTime;
 uniform int uSteps;
 in vec2 vUV;
 out vec4 fragColor;
-$NOISE_3D
+uniform mediump sampler3D uNoiseVol;
+// R392 载体函数：烘焙体采样（窗 16 q 单位周期——REPEAT 平铺无缝；0.0625=1/16
+// 与 NoiseVolumeBaker.WINDOW 单源对表）；种子=平移窗（原 z=uSeed 切片语义的
+// 载体内等价身份映射——场统计基因不变）
+float fieldAt(highp vec3 p) {
+    highp vec3 so = fract(vec3(uSeed * 0.1031, uSeed * 0.173, uSeed * 0.3113));
+    return texture(uNoiseVol, p * 0.0625 + so).r;
+}
 // R383 ign 蓝噪 hash 抖动（interleave gradient noise——静态无时间项=R343 零闪烁）
 float ign(vec2 p) {
     return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y));
@@ -1181,15 +1227,15 @@ void main() {
             float fall = 1.0 - smoothstep(0.12, 1.0, r);
             if (fall > 0.004) {
                 // 层调制（§4.2 层结构体积化——低频壳场 0.55..1.0）
-                float shell = 0.55 + 0.45 * fbm3(vec3(q * 1.7) + vec3(0.0, 0.0, uSeed + 7.7));
+                float shell = 0.55 + 0.45 * fieldAt(vec3(q * 1.7) + vec3(0.0, 0.0, uSeed + 7.7));
                 // 密度场（NEBULA_FS 同族基因：q×2.1+种子 z+域扭曲+脊线+max(den,ridge×0.85)）
                 vec3 fq = q * 2.1 + vec3(0.0, 0.0, uSeed);
                 vec3 warp = vec3(
-                    fbm3(fq + vec3(0.0, uTime * 0.013, 0.0)),
-                    fbm3(fq + vec3(5.2, 1.3, -uTime * 0.011)),
+                    fieldAt(fq + vec3(0.0, uTime * 0.013, 0.0)),
+                    fieldAt(fq + vec3(5.2, 1.3, -uTime * 0.011)),
                     0.0);
-                float den = fbm3(fq + warp * 1.4 + vec3(0.0, 0.0, uTime * 0.017));
-                float ridge = 1.0 - abs(2.0 * fbm3(fq * 2.3 + warp * 1.1) - 1.0);
+                float den = fieldAt(fq + warp * 1.4 + vec3(0.0, 0.0, uTime * 0.017));
+                float ridge = 1.0 - abs(2.0 * fieldAt(fq * 2.3 + warp * 1.1) - 1.0);
                 float d2 = max(den, ridge * 0.85);
                 // 暗尘埃带（NEBULA_FS 同族基因：减法式剪影）
                 float lane = smoothstep(0.62, 0.88, ridge) * (1.0 - den);
@@ -1200,7 +1246,7 @@ void main() {
                     float z01 = clip.z / clip.w * 0.5 + 0.5;
                     if (z01 < sceneZ) {
                         // Hα/OIII fBm 权混场（§4.1——同族 0.6 抖动窗；零 hue(t)）
-                        float w = clamp(uHaMix + (fbm3(fq * 0.8 + vec3(3.3, 7.7, 1.1)) - 0.5) * 0.6, 0.0, 1.0);
+                        float w = clamp(uHaMix + (fieldAt(fq * 0.8 + vec3(3.3, 7.7, 1.1)) - 0.5) * 0.6, 0.0, 1.0);
                         vec3 col = mix(uColorOiii, uColorHa, w) * (0.70 + 1.05 * d2);
                         // 前向背面离散合成：累积自辉+消光 τ
                         float aStep = dens * dt / uRadius * sigma;
@@ -1292,6 +1338,25 @@ void main() {
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA, w, h, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, buf)
+        return ids[0]
+    }
+
+    /** R392 3D 噪声体上传（GL_R8 单通道——LINEAR 三线性+三向 REPEAT 平铺+mipmap 链；句柄纪律同 uploadTexture） */
+    fun uploadTexture3D(data: ByteArray, size: Int): Int {
+        val buf = java.nio.ByteBuffer.allocateDirect(data.size)
+        buf.order(java.nio.ByteOrder.nativeOrder())
+        buf.put(data)
+        buf.flip()
+        val ids = IntArray(1)
+        GLES30.glGenTextures(1, ids, 0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, ids[0])
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_REPEAT)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_REPEAT)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_R, GLES30.GL_REPEAT)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR_MIPMAP_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexImage3D(GLES30.GL_TEXTURE_3D, 0, GLES30.GL_R8, size, size, size, 0, GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, buf)
+        GLES30.glGenerateMipmap(GLES30.GL_TEXTURE_3D)
         return ids[0]
     }
 }

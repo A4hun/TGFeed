@@ -68,11 +68,13 @@ class R355WiringSourceTest {
         )
         // 「别处各算一遍」红旗：装配器内散乘 density 绝迹（displayMetrics/×density
         // 读侧只在场景壳——纯 Kotlin 件零 Android 依赖红线同守）；R386 诚实放行：
-        // 直乘恰一条=帧首第四条 cpxFarMinPx（复合体远档阈 dp 化），除此零乘法
+        // 直乘=帧首 dp 阈族（第四条 cpxFarMinPx 复合体远档阈）；R388 放行增补：
+        // 刀1 隐没带双阈第五/六条（cpxFarHideMinPx/MaxPx）+刀2 REF 第七条
+        // （cpxFilRefPx）——同一帧首块 dp×density 单口换算，别处仍零乘法
         val directMults = Regex("\\*\\s*lodDensity").findAll(fb).toList()
         assertEquals(
-            "lodDensity 直乘仅 build 帧首 R386 一条（cpxFarMinPx dp 阈——别处零乘法）",
-            1,
+            "lodDensity 直乘仅 build 帧首 dp 阈族（R386 一条+R388 刀1 两条+刀2 一条——别处零乘法）",
+            4,
             directMults.size,
         )
         assertTrue(

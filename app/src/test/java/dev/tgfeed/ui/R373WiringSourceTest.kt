@@ -137,10 +137,13 @@ class R373WiringSourceTest {
         val gs = glShaders()
         assertFalse("GlShaders.kt 零 DeepSpaceNebula 引用（复合体走同程序 uniform 变体=零新程序零 shader 改写）", gs.contains("DeepSpaceNebula"))
         assertFalse("GlShaders.kt 零 R373 字样（NEBULA_FS 文本零接触）", gs.contains("R373"))
-        // R358 uniform 四件锚镜像（同款守卫——本批不改写只复诵）
+        // R358 uniform 四件锚镜像（R388 翻新保义：四件→五件=刀2 uFreqScale 频率
+        // 标度维护性扩展——「丝缕基因的尺度变换非基因改变」，scale=1 恒等既有
+        // 基因；判词保义 084499b 先例；R392 翻新：五件→六件=判词① uNoiseVol
+        // sampler 载体件——烘焙 3D 噪声体，五浮点基因零增益）
         val m = Regex("const val NEBULA_FS = \"\"\"([\\s\\S]*?)\"\"\"").find(gs)
         assertTrue("NEBULA_FS 块在场", m != null)
-        assertEquals("NEBULA_FS uniform 仍四件（R358 锚零碰）", 4, Regex("uniform\\s").findAll(m!!.groupValues[1]).count())
+        assertEquals("NEBULA_FS uniform 六件（R392 判词① uNoiseVol sampler 第六件——R358/R388 锚保义翻新）", 6, Regex("uniform\\s").findAll(m!!.groupValues[1]).count())
         val b = builder()
         // 雾族消费零改负锚：buildNebulas 仍走 addNebula（MAX_NEBULAS 行）+发射链原样
         assertTrue("雾族装填口 addNebula 原样在场", Regex("private fun addNebula\\(").containsMatchIn(b))
