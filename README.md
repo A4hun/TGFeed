@@ -54,6 +54,10 @@
 
 以下截图均为**演示模式**画面(未配置 API 凭证时自动进入,内置 Blender 基金会开源测试影片,Big Buck Bunny / Sintel / Jellyfish 片段,CC-BY 3.0)。
 
+**口味星图(Galaxy)**——你的频道宇宙渲染成一张可漫游的星系图(星 = 频道:大小 = 观看时长,颜色 = 内容构成;下图为口味数据的抽象渲染,不含任何频道名):
+
+![口味星图](docs/screenshots/galaxy.png)
+
 | 竖滑信息流 | 长按功能面板 |
 |:---:|:---:|
 | ![竖滑信息流](docs/screenshots/feed_demo.png) | ![长按功能面板](docs/screenshots/action_panel.png) |
