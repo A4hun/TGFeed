@@ -52,7 +52,7 @@
 
 ## 界面一览
 
-以下截图均为**演示模式**画面(未配置 API 凭证时自动进入,内置 Blender 基金会开源测试影片,Big Buck Bunny / Sintel / Jellyfish 片段,CC-BY 3.0);星图截图稍后补充。
+以下截图均为**演示模式**画面(未配置 API 凭证时自动进入,内置 Blender 基金会开源测试影片,Big Buck Bunny / Sintel / Jellyfish 片段,CC-BY 3.0)。
 
 | 竖滑信息流 | 长按功能面板 |
 |:---:|:---:|
