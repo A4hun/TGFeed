@@ -126,3 +126,7 @@ powershell -File scripts/fetch-tdlib.ps1
 ## License
 
 [GPL-3.0](LICENSE) —— GNU General Public License v3.0，全文见 [LICENSE](LICENSE)。
+
+## [讨论组](https://t.me/+HtD24gjnR_lmZTk1)
+
+
