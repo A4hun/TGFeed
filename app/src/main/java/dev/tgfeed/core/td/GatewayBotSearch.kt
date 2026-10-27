@@ -567,7 +567,9 @@ internal fun TdLibGateway.parseMemberCount(raw: String): Int {
     val tail = MEMBER_COUNT_TAIL_REGEX.find(raw.trimEnd())?.value ?: return 0
     val num = MEMBER_COUNT_NUM_REGEX.find(tail)?.value ?: return 0
     val base = num.dropLast(1).toDoubleOrNull() ?: return 0
-    return (base * 1000).toInt()
+    // R435 修6：乘千后可能溢出 Int（如 "2147483k"）——先算 Long 再安全收敛，超 Int 上限回退 0（未知）
+    val total = (base * 1000).toLong()
+    return if (total in 1..Int.MAX_VALUE.toLong()) total.toInt() else 0
 }
 
 /** 正文中 [start, end) 区间所在的整行（按 \n 扩边，越界安全收拢；R48 成员数整行解析用） */

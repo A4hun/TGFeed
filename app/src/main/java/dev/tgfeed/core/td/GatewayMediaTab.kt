@@ -114,9 +114,17 @@ internal suspend fun TdLibGateway.fetchAggregatedMediaImpl(
                     val pageItems = pageMsgs
                         .mapNotNull { m -> runCatching { toVideoItem(chatId, m, null, titleCtx = titleCtx) }.getOrNull() }
                     items.addAll(pageItems)
-                    // 下一页游标：空页（该类型已到底）标记 -1；否则用最后一条消息 id
-                    cursors[chatId] = if (found.messages.isEmpty()) -1L
-                    else found.messages.filterNotNull().last().id
+                    // 下一页游标：空页（该类型已到底）标记 -1；否则用最后一条消息 id。
+                    // R435 口径统一：判空与取值都用已算好的 pageMsgs——全 null 页时
+                    // found.messages 非空但 filterNotNull 为空，旧写法 last() 抛异常
+                    // 落进外层 catch（游标不动→该频道反复重试同页）；与 :694 姊妹口径
+                    // 对齐为「滤后为空=该频道到底」，不再两种判据
+                    cursors[chatId] = if (pageMsgs.isEmpty()) -1L else pageMsgs.last().id
+                } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                    // R439：超时=该频道普通失败（withTimeout 抛出，超时≠取消），跳过本频道
+                    Log.w(TAG, "fetchAggregatedMedia: 频道 $chatId 失败: ${e.message}")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e // R439：协程取消不是失败，必须上抛（await 链靠它停止整页）
                 } catch (e: Exception) {
                     Log.w(TAG, "fetchAggregatedMedia: 频道 $chatId 失败: ${e.message}")
                 } finally {
@@ -447,9 +455,16 @@ internal suspend fun TdLibGateway.fetchAggregatedMediaAllImpl(
                         .mapNotNull { m -> runCatching { toVideoItem(chatId, m, null, titleCtx = titleCtx) }.getOrNull() }
                         .forEach { items += it; produced++ }
                     itemCounts[chatId] = produced
-                    // 空页 = 该频道该类型到底（标记 -1）；否则续页游标 = 本页最老一条
-                    msgCursors[chatId] = if (found.messages.isEmpty()) -1L
-                    else found.messages.filterNotNull().last().id
+                    // 空页 = 该频道该类型到底（标记 -1）；否则续页游标 = 本页最老一条。
+                    // R435 口径统一：判空与取值都用已算好的 pageMsgs（全 null 页不再
+                    // filterNotNull().last() 抛异常落外层 catch），与 fetchAggregatedMedia
+                    // 及 :694 姊妹口径对齐
+                    msgCursors[chatId] = if (pageMsgs.isEmpty()) -1L else pageMsgs.last().id
+                } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                    // R439：超时=该频道普通失败（超时≠取消），游标不动窗口轮转回来重试
+                    Log.w(TAG, "fetchAggregatedMediaAll: 频道 $chatId 失败: ${e.message}")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e // R439：协程取消不是失败，必须上抛（await 链靠它停止整页）
                 } catch (e: Exception) {
                     // 单频道失败只跳过（游标不动，窗口轮转回来重试），绝不影响整页
                     Log.w(TAG, "fetchAggregatedMediaAll: 频道 $chatId 失败: ${e.message}")
@@ -692,6 +707,11 @@ suspend fun TdLibGateway.fetchAggregatedMediaAllFast(
                         }
                         .forEach { items += it }
                     msgCursors[chatId] = if (pageMsgs.isEmpty()) -1L else pageMsgs.last().id
+                } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                    // R439：超时=该频道普通失败（超时≠取消），游标不动正路窗口轮转回来重试
+                    Log.w(TAG, "首屏快车道：频道 $chatId 失败: ${e.message}")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e // R439：协程取消不是失败，必须上抛（await 链靠它停止整页）
                 } catch (e: Exception) {
                     // 单频道失败只跳过（游标不动，正路窗口轮转回来重试），不影响快车道整页
                     Log.w(TAG, "首屏快车道：频道 $chatId 失败: ${e.message}")

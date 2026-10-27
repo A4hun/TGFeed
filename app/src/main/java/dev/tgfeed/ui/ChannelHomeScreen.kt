@@ -86,6 +86,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -241,7 +242,8 @@ fun ChannelHomeScreen(
     // 兜底供给（R212 既有），顶部 banner 诚实标注「本地缓存内容」（在线 null 不显示）
     val networkOnline by dev.tgfeed.core.net.NetworkWatch.online.collectAsState()
     // "屏蔽"确认对话框显隐（防误触：点胶囊先弹确认，确认才执行）
-    var showBlockConfirm by remember(brief.id) { mutableStateOf(false) }
+    // R437 H6：rememberSaveable——uiMode/字体缩放/进程重建时对话框状态不丢
+    var showBlockConfirm by rememberSaveable(brief.id) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     // 频道媒体分页：复用现成单频道源（游标语义 = fetchFromChannel/GetChatHistory）；
@@ -398,7 +400,8 @@ fun ChannelHomeScreen(
     // → 网关 searchInChannel 服务端搜，异常回退本地 caption 过滤）；
     // 不开 SearchScreen——它是 MainActivity 整页路由（showSearch when 分支），
     // 本屏对外签名锁定、无法加跳转回调，故搜索态做成本屏内模式。
-    var searchActive by remember(brief.id) { mutableStateOf(false) }
+    // R437 H6：rememberSaveable（搜索态跨配置重建保持）
+    var searchActive by rememberSaveable(brief.id) { mutableStateOf(false) }
     var searchInput by remember(brief.id) { mutableStateOf("") }
     var searchItems by remember(brief.id) { mutableStateOf<List<VideoItem>>(emptyList()) }
     var searchLoading by remember(brief.id) { mutableStateOf(false) }

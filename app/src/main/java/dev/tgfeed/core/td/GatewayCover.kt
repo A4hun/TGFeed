@@ -100,7 +100,7 @@ internal suspend fun TdLibGateway.loadCoverBytesImpl(item: VideoItem): ByteArray
     // 文件时 remote.uniqueId 对不上铸造登记；GetFile 失败同样按不可信处理
     val f0 = runCatching {
         awaitAuthorized()
-        client.send(TdApi.GetFile(item.coverFileId))
+        sendReq(TdApi.GetFile(item.coverFileId))
     }.getOrNull()
     if (f0 == null || (minted.uniqueId.isNotEmpty() && f0.remote?.uniqueId.orEmpty() != minted.uniqueId)) {
         Log.d(TAG, "loadCoverBytes: coverFileId=${item.coverFileId} 验身失败（串号/已失效），转消息反解 key=${item.key}")
@@ -142,7 +142,7 @@ internal suspend fun TdLibGateway.loadPhotoViewPathImpl(item: VideoItem): String
     if (fileId < 0) return null
     return runCatching {
         awaitAuthorized()
-        var f = client.send(TdApi.GetFile(fileId))
+        var f = sendReq(TdApi.GetFile(fileId))
         if (!f.local.isDownloadingCompleted || f.local.path.isEmpty()) {
             f = withTimeout(MSG_COVER_TIMEOUT_MS) {
                 client.send(TdApi.DownloadFile(fileId, 32, 0L, 0L, true))
@@ -186,7 +186,7 @@ internal suspend fun TdLibGateway.loadAudioCoverBytesImpl(item: VideoItem): Byte
     coverBytesCache[item.audioCoverFileId]?.let { return it }
     val f0 = runCatching {
         awaitAuthorized()
-        client.send(TdApi.GetFile(item.audioCoverFileId))
+        sendReq(TdApi.GetFile(item.audioCoverFileId))
     }.getOrNull()
     if (f0 == null || (minted.uniqueId.isNotEmpty() && f0.remote?.uniqueId.orEmpty() != minted.uniqueId)) {
         Log.d(TAG, "loadAudioCoverBytes: audioCoverFileId=${item.audioCoverFileId} 验身失败（串号/已失效），转消息反解 key=${item.key}")
@@ -217,7 +217,7 @@ internal suspend fun TdLibGateway.loadAudioCoverBytesImpl(item: VideoItem): Byte
  */
 internal suspend fun TdLibGateway.reviveFileIdByMessageImpl(chatId: Long, messageId: Long): Int? = runCatching {
     awaitAuthorized()
-    val msg = client.send(TdApi.GetMessage(chatId, messageId))
+    val msg = sendReq(TdApi.GetMessage(chatId, messageId))
     when (val c = msg.content) {
         is TdApi.MessageVideo -> c.video.video.id
         is TdApi.MessagePhoto -> c.photo.sizes.lastOrNull()?.photo?.id
@@ -241,7 +241,7 @@ internal suspend fun TdLibGateway.resolveCoverFrameFileIdImpl(item: VideoItem): 
     if (item.fileId >= 0 && item.fileUniqueId.isNotEmpty()) {
         val f = runCatching {
             awaitAuthorized()
-            client.send(TdApi.GetFile(item.fileId))
+            sendReq(TdApi.GetFile(item.fileId))
         }.getOrNull()
         if (f != null && f.remote?.uniqueId.orEmpty() == item.fileUniqueId) return item.fileId
         Log.d(TAG, "resolveCoverFrameFileId: fileId=${item.fileId} 验身不符，按消息反解换发 key=${item.key}")
@@ -260,7 +260,7 @@ internal suspend fun TdLibGateway.downloadPartialCoverImpl(fileId: Int): String?
     awaitAuthorized()
     // R76：抽帧前缀与泵分块同文件串行（见 videoDlMutexes），防互杀
     val f = videoDlMutex(fileId).withLock {
-        client.send(TdApi.DownloadFile(fileId, 32, 0L, 2L * 1024 * 1024, true))
+        sendReq(TdApi.DownloadFile(fileId, 32, 0L, 2L * 1024 * 1024, true))
     }
     val p = f.local.path
     if (p.isNotEmpty() && java.io.File(p).isFile && f.local.downloadedSize > 100_000) p else null

@@ -1,6 +1,7 @@
 package dev.tgfeed.core.store
 
 import android.content.Context
+import android.util.Log
 import dev.tgfeed.core.feed.ChannelCollection
 import dev.tgfeed.core.feed.PlayQueue
 import dev.tgfeed.core.feed.PlayQueueEntry
@@ -9,6 +10,7 @@ import dev.tgfeed.core.td.VideoItem
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 
 /**
  * 本地持久化层：收藏 / 点赞 / 观看历史。
@@ -149,22 +151,30 @@ class LocalStore(context: Context) {
     @Synchronized
     fun loadFavorites(): List<VideoItem> {
         favoritesCache?.let { return it }
-        val text = readText(favoritesFile)
-        val list = if (text == null) {
-            emptyList()
-        } else {
-            runCatching {
-                val arr = JSONArray(text)
-                val out = ArrayList<VideoItem>(arr.length())
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    // 逐条防御：单条字段缺失/类型错（toVideoItem 的 getString 会抛 JSONException）
-                    // 只跳过该条，其余收藏保留——不再让一条坏记录拖垮整个文件被清空
-                    runCatching { out += obj.toVideoItem() }
-                }
-                out
-            }.getOrDefault(emptyList()) // 文件损坏时按无收藏处理，不崩溃
+        // R435 损坏检测：区分「文件不存在=合法空态」与「文件在但读不出/整文件解析失败
+        // =损坏态」——合法空态照旧缓存空表；损坏态只返回空表维持 UI 可用、**不写缓存**
+        //（下次调用重读重试），不再让一次读侧抖动被缓存固化成"永久空表"、再被下一次
+        // 全量覆盖写坐实清空（R433 审计 HIGH：收藏永久清零的根因链）
+        val text = try {
+            readTextChecked(favoritesFile)
+        } catch (_: IOException) {
+            return emptyList() // 损坏态：文件在但读不出（磁盘抖动/占用），不入缓存
         }
+        if (text == null) {
+            favoritesCache = emptyList() // 合法空态：从未写过或已被清空，照旧缓存
+            return emptyList()
+        }
+        val list = runCatching {
+            val arr = JSONArray(text)
+            val out = ArrayList<VideoItem>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                // 逐条防御：单条字段缺失/类型错（toVideoItem 的 getString 会抛 JSONException）
+                // 只跳过该条，其余收藏保留——不再让一条坏记录拖垮整个文件被清空
+                runCatching { out += obj.toVideoItem() }
+            }
+            out
+        }.getOrNull() ?: return emptyList() // 整文件解析失败=损坏态：不入缓存，下次重读
         favoritesCache = list
         return list
     }
@@ -1371,36 +1381,43 @@ class LocalStore(context: Context) {
     @Synchronized
     fun listDownloads(): List<DownloadRecord> {
         downloadsCache?.let { return it }
-        val text = readText(downloadsFile)
-        val list = if (text == null) {
-            emptyList()
-        } else {
-            runCatching {
-                val arr = JSONArray(text)
-                val out = ArrayList<DownloadRecord>(arr.length())
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    val key = obj.optString("key")
-                    if (key.isEmpty()) continue // 坏条目跳过
-                    out += DownloadRecord(
-                        key = key,
-                        title = obj.optString("title"),
-                        channelTitle = obj.optString("channelTitle"),
-                        path = obj.optString("path"),
-                        ts = obj.optLong("ts", 0L),
-                        sizeBytes = obj.optLong("sizeBytes", 0L),
-                        chatId = obj.optLong("chatId", 0L),
-                        messageId = obj.optLong("messageId", 0L),
-                        durationSec = obj.optInt("durationSec", 0),
-                        width = obj.optInt("width", 0),
-                        height = obj.optInt("height", 0),
-                        // 老数据无此字段：缺省 0=视频（老版本只有视频能下载成功，缺省恰好正确）
-                        mediaType = obj.optInt("mediaType", 0),
-                    )
-                }
-                out
-            }.getOrDefault(emptyList()) // 文件损坏时按无记录处理，不崩溃
+        // R435 损坏检测：口径同 loadFavorites——「文件不存在=合法空态」照旧缓存空表；
+        //「文件在但读不出/整文件解析失败=损坏态」返回空表但**不写缓存**（下次重读重试），
+        // 不让读侧抖动被缓存固化、再被 addDownload→saveDownloads 全量覆盖写坐实清空
+        val text = try {
+            readTextChecked(downloadsFile)
+        } catch (_: IOException) {
+            return emptyList() // 损坏态：不入缓存
         }
+        if (text == null) {
+            downloadsCache = emptyList() // 合法空态：照旧缓存
+            return emptyList()
+        }
+        val list = runCatching {
+            val arr = JSONArray(text)
+            val out = ArrayList<DownloadRecord>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val key = obj.optString("key")
+                if (key.isEmpty()) continue // 坏条目跳过
+                out += DownloadRecord(
+                    key = key,
+                    title = obj.optString("title"),
+                    channelTitle = obj.optString("channelTitle"),
+                    path = obj.optString("path"),
+                    ts = obj.optLong("ts", 0L),
+                    sizeBytes = obj.optLong("sizeBytes", 0L),
+                    chatId = obj.optLong("chatId", 0L),
+                    messageId = obj.optLong("messageId", 0L),
+                    durationSec = obj.optInt("durationSec", 0),
+                    width = obj.optInt("width", 0),
+                    height = obj.optInt("height", 0),
+                    // 老数据无此字段：缺省 0=视频（老版本只有视频能下载成功，缺省恰好正确）
+                    mediaType = obj.optInt("mediaType", 0),
+                )
+            }
+            out
+        }.getOrNull() ?: return emptyList() // 整文件解析失败=损坏态：不入缓存，下次重读
         downloadsCache = list
         return list
     }
@@ -1962,7 +1979,19 @@ class LocalStore(context: Context) {
     private fun readText(file: File): String? = try {
         if (file.isFile) file.readText() else null
     } catch (_: Exception) {
-        null // 读失败按空数据处理
+        null // 读失败按空数据处理（老口径：20+ loader 沿用；损坏敏感 loader 走 [readTextChecked]）
+    }
+
+    /**
+     * R435 损坏检测读（loadFavorites/listDownloads 两个最高价值 loader 先行换装，
+     * 其余同型 loader 后续照抄口径）：三态——null=文件不存在（合法空态，可缓存空表）；
+     * 非 null=正常内容；上抛 [IOException]=文件在但读不出（损坏态）——调用方据此
+     * 「返回空表但**不写缓存**」，读侧瞬时失败不再被缓存固化成永久空表、
+     * 再被下一次全量覆盖写坐实清空。
+     */
+    private fun readTextChecked(file: File): String? {
+        if (!file.isFile) return null
+        return file.readText() // IOException 原样上抛，由调用方裁决
     }
 
     /** 先写临时文件再 rename，保证落盘的原子性 */
@@ -1970,11 +1999,47 @@ class LocalStore(context: Context) {
         dir.mkdirs()
         val tmp = File(dir, file.name + ".tmp")
         tmp.writeText(text)
-        if (!tmp.renameTo(file)) {
-            // rename 失败（极少见）时退化为直接覆盖写
-            runCatching { file.writeText(text) }
-            tmp.delete()
+        if (moveAtomic(tmp, file)) return
+        // R435：rename 失败不再降级「直接覆盖写」——非原子半写正是读侧损坏源
+        //（file.writeText 半途打断=半截 JSON，下次启动被当损坏处理整表弃读）。
+        // 换名 .tmp2 整写重试一次；仍失败记日志并跳过本次写（调用方下次落盘
+        // 自然重试），宁可少写一次不可写坏既有文件
+        tmp.delete()
+        val tmp2 = File(dir, file.name + ".tmp2")
+        try {
+            tmp2.writeText(text)
+            if (moveAtomic(tmp2, file)) return
+            tmp2.delete()
+            Log.w("LocalStore", "落盘 rename 两次失败，跳过本次写：${file.name}")
+        } catch (e: Exception) {
+            tmp2.delete()
+            Log.w("LocalStore", "落盘 .tmp2 重试异常，跳过本次写：${file.name} ${e.javaClass.simpleName}")
         }
+    }
+
+    /**
+     * R435 原子替换移动（tmp → 正式文件）：[File.renameTo] 在 Windows 上目标已存在时
+     * 稳定失败（旧代码被迫留「降级直写」的根因）；NIO [Files.move] 的
+     * REPLACE_EXISTING+ATOMIC_MOVE 在 Linux（rename(2)）与 NTFS（MoveFileEx）上
+     * 都是同卷原子覆盖。minSdk 26 起 NIO.2 全量在场，无需 desugaring。
+     * 同目录移动不支持原子标志的冷门文件系统上退普通替换移动（仍是整文件替换非半写）。
+     */
+    private fun moveAtomic(src: File, dst: File): Boolean = try {
+        val s = src.toPath()
+        val d = dst.toPath()
+        try {
+            java.nio.file.Files.move(
+                s, d,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            )
+            true
+        } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+            java.nio.file.Files.move(s, d, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            true
+        }
+    } catch (_: Exception) {
+        false
     }
 
     companion object {

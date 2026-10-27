@@ -118,7 +118,11 @@ internal fun ActionRail(
             icon = if (liked) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
             tint = if (liked) LikeRed else TgFeedTokens.TextHigh,
             label = "",
-            onClick = onToggleLike,
+            // R437 H3：连点防抖（幂等）——已赞时点按无操作：旧代码双击=净取消
+            //（toggle 翻两次回原状但广场计数虚增一次，cancel 不回写计数）。
+            // 取消赞走既有长按面板「推荐」行（FeedScreen onRecommend=toggleLike，
+            // 已赞时再点取消赞，与双击手势"已赞只飘心不重复回写"同一口径）
+            onClick = { if (!liked) onToggleLike() },
             iconSize = iconSize,
             touchMin = railTouchMin,
             bounceOnClick = true,

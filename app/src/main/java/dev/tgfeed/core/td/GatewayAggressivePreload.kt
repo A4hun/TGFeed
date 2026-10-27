@@ -344,7 +344,7 @@ internal class AggressivePreloadManager(private val gw: TdLibGateway) {
         // 2) GetFile 批查（幂等本地查询，1Hz/条便宜）：完成态/停滞/速率观测原料
         val files = HashMap<Int, TdApi.File?>(tracked.size)
         for (id in tracked.keys) {
-            files[id] = runCatching { gw.client.send(TdApi.GetFile(id)) }.getOrNull()
+            files[id] = runCatching { gw.sendReq(TdApi.GetFile(id)) }.getOrNull()
         }
 
         // 3) 两拍决策：先算 A 档的「想要槽」意向（不计槽占用——占槽的 B 档据此
@@ -520,7 +520,7 @@ internal class AggressivePreloadManager(private val gw: TdLibGateway) {
             delay(AGGR_LOCK_POLL_MS)
         }
         return try {
-            runCatching { gw.client.send(TdApi.DownloadFile(id, priority, 0L, 0L, false)) }.isSuccess
+            runCatching { gw.sendReq(TdApi.DownloadFile(id, priority, 0L, 0L, false)) }.isSuccess
         } finally {
             runCatching { mutex.unlock() }
         }
@@ -535,7 +535,7 @@ internal class AggressivePreloadManager(private val gw: TdLibGateway) {
      * 不受影响——抢占闸在泵侧锁内自决策，本取消与其无锁序关系。
      */
     private suspend fun cancelFullLoad(id: Int) {
-        runCatching { gw.client.send(TdApi.CancelDownloadFile(id, false)) }
+        runCatching { gw.sendReq(TdApi.CancelDownloadFile(id, false)) }
     }
 
     private companion object {

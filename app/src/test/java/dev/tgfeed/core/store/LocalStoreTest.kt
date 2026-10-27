@@ -126,6 +126,45 @@ class LocalStoreTest {
         assertEquals(listOf("good1", "good2"), store.loadFavorites().map { it.key })
     }
 
+    // ---------------- R435 损坏检测（三态口径） ----------------
+
+    @Test
+    fun `收藏整文件损坏不入缓存_文件修复后同实例读回`() {
+        // 行为：整文件解析失败=损坏态——返回空表维持 UI 可用但**不写缓存**（下次调用
+        // 重读重试）；老口径空表入缓存，读侧一次抖动会被缓存固化成永久空表、再被下一
+        // 次全量覆盖写坐实清空（R433 审计 HIGH 根因链）
+        storeDir.mkdirs()
+        File(storeDir, "favorites.json").writeText("这不是 json {{{")
+        assertTrue(store.loadFavorites().isEmpty())
+        // 文件修复（外部恢复/下一轮成功写入）后：同实例再读能看到新内容——证明
+        // 损坏态没把空表灌进缓存
+        File(storeDir, "favorites.json").writeText("""[{"key":"a","chatId":1,"messageId":2}]""")
+        assertEquals(listOf("a"), store.loadFavorites().map { it.key })
+    }
+
+    @Test
+    fun `下载记录整文件损坏不入缓存_文件修复后同实例读回`() {
+        // 口径同收藏：downloads.json 整文件解析失败=损坏态不入缓存，修复后同实例自愈
+        storeDir.mkdirs()
+        File(storeDir, "downloads.json").writeText("这不是 json {{{")
+        assertTrue(store.listDownloads().isEmpty())
+        File(storeDir, "downloads.json").writeText(
+            """[{"key":"a","title":"t","channelTitle":"c","path":"p","ts":1}]"""
+        )
+        assertEquals(listOf("a"), store.listDownloads().map { it.key })
+    }
+
+    @Test
+    fun `收藏文件不存在按合法空态缓存`() {
+        // 反向锚：文件不存在=合法空态（从未写过/已清空）——空表入缓存是**正确**行为，
+        // 与损坏态（不入缓存）区分；真实场景里磁盘表只会由本实例自己的 save 写入
+        // （写后重建缓存），不会出现"外部塞文件同实例看不见"的错位
+        assertTrue(store.loadFavorites().isEmpty())
+        storeDir.mkdirs()
+        File(storeDir, "favorites.json").writeText("""[{"key":"a","chatId":1,"messageId":2}]""")
+        assertTrue("合法空态应命中缓存不再重读磁盘", store.loadFavorites().isEmpty())
+    }
+
     // ---------------- 序列化口径 ----------------
 
     @Test

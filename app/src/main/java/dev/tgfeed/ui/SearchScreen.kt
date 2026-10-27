@@ -398,8 +398,14 @@ fun SearchScreen(
     // 返回键回搜索页（服务端结果还在 VM 里）时不重搜：直接展示，但本地层补跑一次——
     // 页面态 localResults 随重组丢失，不补跑则本地车道缺席、混排序被破坏
     LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
-        keyboard?.show() // 获焦后显式弹键盘：进页即输入（搜索页第一诉求）
+        // R437 H5：只在「新搜索会话」自动获焦弹键盘（搜索页第一诉求=进页即输入）；
+        // 返回页（服务端结果还在 VM，initialQuery 与 fullSearchQuery 同词）不弹——
+        // 键盘半屏盖住刚恢复的结果列表，用户还得先收键盘才能看内容。
+        val returningWithResults = initialQuery.isNotBlank() && vm.fullSearchQuery == initialQuery.trim()
+        if (!returningWithResults) {
+            focusRequester.requestFocus()
+            keyboard?.show()
+        }
         tasteWords = vm.tasteSuggestions(8)
         if (initialQuery.isNotBlank()) {
             // R107/H5：返回页判定从"VM 有无结果"改为"结果是否属于本词"

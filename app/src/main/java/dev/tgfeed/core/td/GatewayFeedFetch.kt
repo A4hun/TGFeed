@@ -2,10 +2,13 @@ package dev.tgfeed.core.td
 
 import android.util.Log
 import dev.tgfeed.core.feed.DiscoveryGraph
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -491,11 +494,21 @@ internal suspend fun TdLibGateway.fetchAggregated(cursor: String?, limit: Int, q
                 val from = cursors[chatId] ?: 0L
                 if (from < 0) return@async chatId to FeedPage(emptyList(), "-1")
                 val page = sem.withPermit {
-                    runCatching {
+                    // R439 取消传播（同刀 GatewayBotSearch:719-720）：协程取消必须上抛——
+                    // async 扇出靠 coroutineScope 结构化并发连坐取消，awaitAll/整页靠它停止；
+                    // 超时（TimeoutCancellationException 是 CancellationException 子类，
+                    // fetchFromChannel 内 withTimeout 抛出）按普通失败落空页——超时≠取消。
+                    try {
                         fetchFromChannel(chatId, from, quotaFor(chatId), query, maxRounds = 4, cascadeBudget = cascadeBudget)
+                    } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                        Log.w(TAG, "fetchAggregated: chatId=$chatId 失败: ${e.message}")
+                        FeedPage(emptyList(), from.toString())
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e // 协程取消不是失败，必须上抛
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "fetchAggregated: chatId=$chatId 失败: ${e.message}")
+                        FeedPage(emptyList(), from.toString())
                     }
-                        .onFailure { Log.w(TAG, "fetchAggregated: chatId=$chatId 失败: ${it.message}") }
-                        .getOrElse { FeedPage(emptyList(), from.toString()) }
                 }
                 chatId to page
             }
@@ -1173,6 +1186,63 @@ internal suspend fun TdLibGateway.expandBlankCaptions(
             (m.mediaAlbumId == 0L || !albumCaps.containsKey(m.mediaAlbumId))
     }
     if (blank.isEmpty()) return BlankExpandResult(albumCaps, emptyMap())
+    // R439 同 chat 展开航班（并发窗区间幂等）：媒体 tab / 全局搜索 / 媒体全量窗可对
+    // 同一 chat 并发调用本函数，锚点重叠时两班并发拉同一批邻居窗（GetChatHistory×2，
+    // 浪费且时序不齐）。后到者不另起航班，直接 await 进行中航班的结果——notes 键是
+    // chat 域 message id（超集无害，消费方只查自己关心的 id），albumCaps 按自己页面段
+    // 重算（航班窗已写回跨页缓存，天然并入）。代价：后到者本轮**独有**的新锚点不另飞
+    //（本函数本就"只产证据、任何失败只丢增量"，锚点未登记 TTL 不过期，下轮自然补上）。
+    // 死班（占舱协程被取消）不连坐后到者：清舱后重试自飞；双参 remove 防误清他班。
+    while (true) {
+        val inFlight = expandBlankCaptionsInFlight[chatId]
+        if (inFlight != null) {
+            try {
+                val r = inFlight.await()
+                return BlankExpandResult(mergedAlbumCaptions(chatId, pageMsgs), r.notes)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                currentCoroutineContext().ensureActive() // 自己也被取消→此处如实上抛
+                expandBlankCaptionsInFlight.remove(chatId, inFlight)
+                continue
+            }
+        }
+        val joined = coroutineScope {
+            // LAZY：占舱成功才起跑——输了竞速就取消一个从未起跑的航班（零请求浪费）
+            val myFlight = async(context = Dispatchers.IO, start = CoroutineStart.LAZY) {
+                expandBlankCaptionsAnchored(chatId, pageMsgs, albumCaps, blank)
+            }
+            val winner = expandBlankCaptionsInFlight.putIfAbsent(chatId, myFlight)
+            if (winner == null) {
+                try {
+                    myFlight.await()
+                } finally {
+                    expandBlankCaptionsInFlight.remove(chatId, myFlight)
+                }
+            } else {
+                myFlight.cancel()
+                try {
+                    winner.await()
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    currentCoroutineContext().ensureActive()
+                    expandBlankCaptionsInFlight.remove(chatId, winner)
+                    null // 死班已清，外层重试
+                }
+            }
+        }
+        if (joined != null) return joined
+    }
+}
+
+/**
+ * R439 从 [expandBlankCaptions] 拆出的独飞体（锚点选择 + 窗口扇出）：由航班表占舱
+ * 成功的调用方经 LAZY async 起跑；占舱协程被取消时由占舱方 finally 清舱，等结果的
+ * 后到者收到 CancellationException 自飞（不连坐）。
+ */
+private suspend fun TdLibGateway.expandBlankCaptionsAnchored(
+    chatId: Long,
+    pageMsgs: List<TdApi.Message>,
+    albumCaps: Map<Long, String>,
+    blank: List<TdApi.Message>,
+): BlankExpandResult {
     // 选锚点：相册按 albumId 去重（一个相册一次窗口查询），散媒体各自为锚；先到先得
     val anchorAlbums = HashSet<Long>()
     val anchors = ArrayList<Long>()
@@ -1188,10 +1258,14 @@ internal suspend fun TdLibGateway.expandBlankCaptions(
     }
     if (anchors.isEmpty()) return BlankExpandResult(albumCaps, emptyMap())
     val out = java.util.concurrent.ConcurrentHashMap<Long, String>()
+    // R439 取消传播（同刀 GatewayBotSearch:719-720）：协程取消必须上抛——async
+    // 扇出的兄弟任务靠 coroutineScope 结构化并发连坐取消，父调用链靠它整体停止。
+    // 超时（TimeoutCancellationException 是 CancellationException 子类）按普通失败
+    // 落锚点级回落（丢该锚增量，不影响兄弟锚点）——超时≠取消，要区分。
     coroutineScope {
         anchors.map { anchorId ->
             async(Dispatchers.IO) {
-                runCatching {
+                try {
                     // 窗口：锚点 + 8 更新 + 7 更老（未过滤整窗——服务端类型过滤只作用于
                     // 主搜索响应，caption 建表必须基于未过滤窗口）；更的一侧覆盖形态B
                     // 文字帖（比媒体新），同窗覆盖相册兄弟（含异类型成员）
@@ -1206,8 +1280,13 @@ internal suspend fun TdLibGateway.expandBlankCaptions(
                     for (m in blank) {
                         notes[m.id]?.let { out.putIfAbsent(m.id, it) }
                     }
-                }.onFailure {
-                    Log.w(TAG, "媒体tab空caption展开失败 chatId=$chatId anchor=$anchorId: ${it.message}")
+                } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                    // 超时=该锚点普通失败：静默丢这次增量（锚点级回落，不连坐兄弟锚点）
+                    Log.w(TAG, "媒体tab空caption展开超时 chatId=$chatId anchor=$anchorId")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e // 协程取消不是失败，必须上抛（扇出兄弟+父链靠它停止）
+                } catch (e: Throwable) {
+                    Log.w(TAG, "媒体tab空caption展开失败 chatId=$chatId anchor=$anchorId: ${e.message}")
                 }
             }
         }.awaitAll()

@@ -295,22 +295,54 @@ internal fun AudioCard(
     }
 
     // 激活态驱动播放；失焦暂停。backgroundPause 并入守卫。
+    // R437 H1：后台闸往返不再无条件复活播放——闸落沿先快照"用户在播意图"再拉停，
+    // 闸升沿仅快照为真才恢复（视频侧 FeedScreen currentPlayerPauser/Resumer 的
+    // 记账纪律）。bgGateWasDown 标记闸沿防重：闸落期间 effect 重启不重读快照
+    // （此时 playWhenReady 已被打成 false，重读会把真意图覆盖成 false）。
+    var bgPauseWasPlaying by remember(item.key) { mutableStateOf(false) }
+    var bgGateWasDown by remember(item.key) { mutableStateOf(false) }
     LaunchedEffect(isActive, playUri, backgroundPause) {
         if (sharedPlayer == null) {
             // 自管模式（原逻辑）：后台暂停期间即使翻页重组触发本 effect 重启，
-            // 也不会把 playWhenReady 重新拉起（否则退后台滑到音频页会立刻出声）
-            player.playWhenReady = isActive && playUri != null && !backgroundPause
+            // 也不会把 playWhenReady 重新拉起（否则退后台滑到音频页会立刻出声）。
+            // R437 H1：闸落先快照意图再拉停，闸升仅 wasPlaying 才恢复——自管播放器
+            // 不入池（pauser/后台闸都够不到），本 effect 就是它唯一的暂停/恢复执行者
+            if (backgroundPause) {
+                if (!bgGateWasDown) {
+                    bgPauseWasPlaying = player.playWhenReady
+                    bgGateWasDown = true
+                }
+                player.playWhenReady = false
+            } else if (bgGateWasDown) {
+                bgGateWasDown = false
+                player.playWhenReady = bgPauseWasPlaying && isActive && playUri != null
+            } else {
+                player.playWhenReady = isActive && playUri != null
+            }
         } else {
             // 共享模式：失活不再拉停（离开音频卡继续放，迷你播放条接管）；
             // 只在"本条持有播放器"时动作，防误动别卡已接管的新音轨
             when {
-                backgroundPause && player.currentMediaItem?.mediaId == item.key ->
+                backgroundPause && player.currentMediaItem?.mediaId == item.key -> {
+                    // R437 H1 同刀：闸落沿拉停（Intent 快照在 FeedScreen pauser 侧
+                    // 已先于本 effect 落袋——onStop 同步段先跑 pauser 再等重组，
+                    // 此处读 playWhenReady 恒 false，读不到真意图），本卡只记账
+                    // 闸态供闸升沿判定，不抢恢复权
+                    bgGateWasDown = true
                     player.playWhenReady = false
+                }
                 !backgroundPause && isActive && playUri != null &&
                     player.currentMediaItem?.mediaId == item.key -> {
-                    // 播完后跳回本条：ENDED 态下拉 playWhenReady 不会重播，先归零
-                    if (player.playbackState == Player.STATE_ENDED) player.seekTo(0)
-                    player.playWhenReady = true
+                    if (bgGateWasDown) {
+                        // R437 H1：闸升沿——恢复权归 FeedScreen resumer（bgPausedAudio
+                        // 记账：仅落闸前在播的才续播），本卡不再无条件拉起，手动
+                        // 暂停的音频后台往返后不再被复活
+                        bgGateWasDown = false
+                    } else {
+                        // 播完后跳回本条：ENDED 态下拉 playWhenReady 不会重播，先归零
+                        if (player.playbackState == Player.STATE_ENDED) player.seekTo(0)
+                        player.playWhenReady = true
+                    }
                 }
             }
         }

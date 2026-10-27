@@ -121,9 +121,9 @@ internal val INLINE_BOT_DISPLAY_NAMES = mapOf(
  * （注意是 userId 数组不是 User 数组，逐个 GetUser 取用户名）。
  */
 private suspend fun TdLibGateway.getRecentInlineBotUserId(bot: String): Long? = runCatching {
-    val ids = client.send(TdApi.GetRecentInlineBots()).userIds?.toList().orEmpty()
+    val ids = sendReq(TdApi.GetRecentInlineBots()).userIds?.toList().orEmpty()
     for (id in ids) {
-        val u = runCatching { client.send(TdApi.GetUser(id)) }.getOrNull() ?: continue
+        val u = runCatching { sendReq(TdApi.GetUser(id)) }.getOrNull() ?: continue
         val names = (u.usernames?.activeUsernames ?: emptyArray()) +
             (u.usernames?.editableUsername?.takeIf { it.isNotBlank() }?.let { arrayOf(it) } ?: emptyArray()) +
             (u.usernames?.collectibleUsernames ?: emptyArray())
@@ -170,9 +170,9 @@ private suspend fun TdLibGateway.resolveInlineBotViaServerSearch(bot: String): L
             ?.chatIds?.toList().orEmpty()
         if (ids.isEmpty()) continue
         for (id in ids) {
-            val chat = runCatching { client.send(TdApi.GetChat(id)) }.getOrNull() ?: continue
+            val chat = runCatching { sendReq(TdApi.GetChat(id)) }.getOrNull() ?: continue
             val userId = (chat.type as? TdApi.ChatTypePrivate)?.userId ?: continue
-            val user = runCatching { client.send(TdApi.GetUser(userId)) }.getOrNull() ?: continue
+            val user = runCatching { sendReq(TdApi.GetUser(userId)) }.getOrNull() ?: continue
             // 验身：活跃/可编辑/可收藏用户名，任一精确等于查询的**用户名**
             // （展示名轮也按用户名验——搜"GIF Bot"只认 username=gif 的那一个，
             // 防同名仿冒 bot 冒名顶替）

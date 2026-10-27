@@ -227,6 +227,9 @@ private const val CHAT_STORIES_REFRESH_CONCURRENCY = 8
 /** 快拍快照单频道查询超时：正常毫秒级；TDLib 拥塞排队时按超时弃权（该频道本轮无快拍，更新流会补） */
 private const val CHAT_STORIES_PER_CALL_TIMEOUT_MS = 5_000L
 
+/** listChannels 逐 chat GetChat 并发闸（R435 并发化）：数百频道串行 JNI 往返是 TTL 过期重跑的时长大头 */
+private const val LIST_CHANNELS_GET_CHAT_CONCURRENCY = 8
+
 /**
  * 频道头像缓存上限（条，R428）：单条小图字节 ≈10-50KB，256 条 ≈几到十几 MB 量级——
  * 覆盖"抽屉+订阅页全量频道"的回访窗口，淘汰后走 TDLib 秒级重拉，用户无感。
@@ -328,6 +331,20 @@ class TdLibGateway(
      * 消息 id 邻接校验，刷新从头拉/换频道时首条消息比文字帖新，天然不命中。
      */
     internal val tailNoteStore = java.util.concurrent.ConcurrentHashMap<Long, TailNote>()
+
+    /**
+     * R439 同 chat 展开航班表（expandBlankCaptions 并发去重）：chatId → 进行中的
+     * 展开协程 [Deferred]。媒体 tab / 全局搜索 / fetchAggregatedMediaAll 可并发对
+     * **同一 chat** 各自发起 expandBlankCaptions——锚点重叠时两班并发拉同一批
+     * 邻居窗（GetChatHistory 请求×2，浪费且时序不齐）。本表让后到者不另起航班，
+     * 直接 await 进行中航班的结果（notes 键是 chat 域 message id，超集无害；
+     * albumCaps 后到者按自己页面段重算，航班窗已写回跨页缓存天然并入）。
+     * 占舱用 putIfAbsent + LAZY async（输者取消从未起跑的航班，零请求浪费）；
+     * 死班（占舱协程被取消）由 finally 双参 remove 清舱，等结果的后到者自飞不连坐。
+     * 外层 ConcurrentHashMap；[Deferred] 的注册/清除纪律见 expandBlankCaptions 实现。
+     */
+    internal val expandBlankCaptionsInFlight =
+        java.util.concurrent.ConcurrentHashMap<Long, kotlinx.coroutines.Deferred<BlankExpandResult>>()
 
     /**
      * R257b 标题回退链·链③转发原帖 caption 缓存：原帖坐标 "chatId:messageId" → 条目。
@@ -1141,16 +1158,20 @@ class TdLibGateway(
         // R88 去上限：每列表先 LoadChats 循环到 404 全量加载，再 GetChats 一次全取，
         // 长尾频道（按活跃序排在后面的）不再漏；整个枚举放 IO 调度器（调用方可能在主线程起协程）
         return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            // R435：全 4 处裸 client.send 过 sendReq（R169 F1 家族收口；R216 时姊妹方法
+            // listSearchableChatsImpl 已换、本体漏网）：本枚举在聚合 Feed 每轮翻页路径上，
+            // 原生管线拥塞时裸 send 可挂数分钟。超时=普通失败异常，语义同既有失败路径
+            //（GetChats 主列表失败照旧上抛失败本轮；归档/文件夹/逐 chat GetChat 失败照旧跳过不阻塞整表）
             loadAllChatsInList(TdApi.ChatListMain())
-            val mainIds = client.send(TdApi.GetChats(TdApi.ChatListMain(), CHAT_ENUM_ALL_LIMIT)).chatIds.toList()
+            val mainIds = sendReq(TdApi.GetChats(TdApi.ChatListMain(), CHAT_ENUM_ALL_LIMIT)).chatIds.toList()
             val archIds = runCatching {
                 loadAllChatsInList(TdApi.ChatListArchive())
-                client.send(TdApi.GetChats(TdApi.ChatListArchive(), CHAT_ENUM_ALL_LIMIT)).chatIds.toList()
+                sendReq(TdApi.GetChats(TdApi.ChatListArchive(), CHAT_ENUM_ALL_LIMIT)).chatIds.toList()
             }.getOrDefault(emptyList())
             val folderIds = chatFolderIds.flatMap { folderId ->
                 runCatching {
                     loadAllChatsInList(TdApi.ChatListFolder(folderId))
-                    client.send(TdApi.GetChats(TdApi.ChatListFolder(folderId), CHAT_ENUM_ALL_LIMIT)).chatIds.toList()
+                    sendReq(TdApi.GetChats(TdApi.ChatListFolder(folderId), CHAT_ENUM_ALL_LIMIT)).chatIds.toList()
                 }.getOrDefault(emptyList())
             }
             val chatIdSet = LinkedHashSet<Long>()
@@ -1158,14 +1179,28 @@ class TdLibGateway(
             chatIdSet += archIds
             chatIdSet += folderIds
             Log.d(TAG, "频道枚举分列表：主=${mainIds.size} 归档=${archIds.size} 文件夹=${folderIds.size} 合计=${chatIdSet.size}（listChannels）")
-            val result = chatIdSet.toList().mapNotNull { id ->
-                val chat = runCatching { client.send(TdApi.GetChat(id)) }.getOrNull() ?: return@mapNotNull null
-                val type = chat.type
-                if (type is TdApi.ChatTypeSupergroup && type.isChannel) {
-                    channelTitleCache[id] = chat.title
-                    ChannelBrief(id, chat.title, null)
-                } else {
-                    null
+            // R435：串行逐 GetChat 并发化（awaitAll 保序、与 chatIdSet 同序，并发闸 8）：
+            // 数百频道串行 JNI 往返是 TTL 过期重跑的时长大头；单个失败（含超时）只跳过
+            // 该会话不影响整表，口径同 listSearchableChats
+            val ids = chatIdSet.toList()
+            val sem = Semaphore(LIST_CHANNELS_GET_CHAT_CONCURRENCY)
+            val result = coroutineScope {
+                ids.map { id ->
+                    async(Dispatchers.IO) {
+                        sem.withPermit {
+                            runCatching { sendReq(TdApi.GetChat(id)) }.getOrNull()
+                        }
+                    }
+                }.awaitAll().mapIndexedNotNull { i, chat ->
+                    chat ?: return@mapIndexedNotNull null
+                    val id = ids[i]
+                    val type = chat.type
+                    if (type is TdApi.ChatTypeSupergroup && type.isChannel) {
+                        channelTitleCache[id] = chat.title
+                        ChannelBrief(id, chat.title, null)
+                    } else {
+                        null
+                    }
                 }
             }
             Log.d(TAG, "频道枚举：共 ${result.size} 个频道（listChannels 全量，含归档/文件夹）")
@@ -1926,7 +1961,10 @@ class TdLibGateway(
         if (!likeReactionSent.add("$chatId:$messageId")) return false
         return runCatching {
             awaitAuthorized()
-            client.send(
+            // R435：裸 send 过 sendReq 10s 超时（R169 F1 家族）——点赞回写在每条点赞
+            // 落的路径上，原生管线拥塞时裸 send 永挂会拖住点赞流程；超时=普通失败
+            // 异常，下方 getOrElse 照旧静默（不影响本地点赞）
+            sendReq(
                 TdApi.AddMessageReaction(chatId, messageId, TdApi.ReactionTypeEmoji("👍"), false, false),
             )
             Log.i(TAG, "点赞回写已受理 chatId=$chatId msgId=$messageId")
@@ -1935,7 +1973,7 @@ class TdLibGateway(
             scope.launch(Dispatchers.IO) {
                 runCatching {
                     delay(2_000)
-                    val m = client.send(TdApi.GetMessage(chatId, messageId))
+                    val m = sendReq(TdApi.GetMessage(chatId, messageId))
                     val mine = m.interactionInfo?.reactions?.reactions
                         ?.firstOrNull { (it.type as? TdApi.ReactionTypeEmoji)?.emoji == "👍" }
                     Log.d(
@@ -2013,10 +2051,13 @@ class TdLibGateway(
         // 一次性账号能力诊断（会话内只跑一次）：Premium 态 + chatlist 限额 + 既有文件夹可分享态
         if (!packCapabilityProbed) {
             packCapabilityProbed = true
+            // R435：礼包邀请链接域全 21 处裸 client.send 过 sendReq（R169 F1 家族，R363 时
+            // 广场族已收口、本域漏网）——礼包链是用户显式点按钮的写路径，原生管线拥塞时
+            // 裸 send 永挂=按钮无响应零日志；超时=普通失败异常，各步 runCatching 照旧接住
             runCatching {
-                val me = client.send(TdApi.GetMe())
+                val me = sendReq(TdApi.GetMe())
                 suspend fun opt(name: String): Any = runCatching {
-                    when (val v = client.send(TdApi.GetOption(name))) {
+                    when (val v = sendReq(TdApi.GetOption(name))) {
                         is TdApi.OptionValueInteger -> v.value
                         is TdApi.OptionValueString -> v.value
                         is TdApi.OptionValueBoolean -> v.value
@@ -2025,7 +2066,7 @@ class TdLibGateway(
                 }.getOrDefault("?")
                 val folderStates = chatFolderIds.map { id ->
                     "$id:" + runCatching {
-                        (client.send(TdApi.GetChatFolder(id)) as TdApi.ChatFolder).isShareable
+                        (sendReq(TdApi.GetChatFolder(id)) as TdApi.ChatFolder).isShareable
                     }.getOrNull()
                 }
                 Log.i(
@@ -2049,7 +2090,7 @@ class TdLibGateway(
         // 路线二（主路）：建普通文件夹 → EditChatFolder 转可分享合集 → 导出邀请链接
         // （官方客户端"分享文件夹"同款链路；不转直接导出实证报 FILTER_ID_INVALID）
         val regular = runCatching {
-            val folder = client.send(
+            val folder = sendReq(
                 TdApi.CreateChatFolder(
                     TdApi.ChatFolder(
                         TdApi.ChatFolderName(TdApi.FormattedText(title, emptyArray()), false),
@@ -2070,7 +2111,7 @@ class TdLibGateway(
             //（客户端侧拦截改标志），但实证服务端已受理转换（updateDialogFilter 落了
             // dialogFilterChatlist）——错误只记日志不阻断，紧接着的导出依赖服务端转换生效
             runCatching {
-                client.send(
+                sendReq(
                     TdApi.EditChatFolder(
                         folder.id,
                         TdApi.ChatFolder(
@@ -2092,7 +2133,7 @@ class TdLibGateway(
             var lastErr: Throwable? = null
             for (attempt in 1..3) {
                 val got = runCatching {
-                    client.send(TdApi.CreateChatFolderInviteLink(folder.id, title, ids.toLongArray()))
+                    sendReq(TdApi.CreateChatFolderInviteLink(folder.id, title, ids.toLongArray()))
                 }.onFailure { lastErr = it; Log.i(TAG, "频道礼包导出第${attempt}次被拒（诊断）：${it.message}") }.getOrNull()
                 if (got != null && !got.inviteLink.isNullOrBlank()) {
                     link = got
@@ -2119,7 +2160,7 @@ class TdLibGateway(
         )
         for (v in variants) {
             val made = runCatching {
-                val folder = client.send(
+                val folder = sendReq(
                     TdApi.CreateChatFolder(
                         TdApi.ChatFolder(
                             TdApi.ChatFolderName(TdApi.FormattedText(title, emptyArray()), false),
@@ -2133,7 +2174,7 @@ class TdLibGateway(
                         )
                     )
                 )
-                val link = client.send(TdApi.CreateChatFolderInviteLink(folder.id, title, ids.toLongArray()))
+                val link = sendReq(TdApi.CreateChatFolderInviteLink(folder.id, title, ids.toLongArray()))
                 Log.i(
                     TAG,
                     "频道礼包链接已生成（直建可分享合集·${v.tag} folderId=${folder.id}）：${link.inviteLink} 频道数=${link.chatIds?.size ?: ids.size} 合集=$title",
@@ -2165,7 +2206,7 @@ class TdLibGateway(
         awaitChatFolderSync()
         val candidates = chatFolderInfos.mapNotNull { info ->
             runCatching {
-                val f = client.send(TdApi.GetChatFolder(info.id)) as? TdApi.ChatFolder
+                val f = sendReq(TdApi.GetChatFolder(info.id)) as? TdApi.ChatFolder
                     ?: return@mapNotNull null
                 FolderDupCandidate(
                     folderId = info.id,
@@ -2181,7 +2222,7 @@ class TdLibGateway(
         when (val decision = decideFolderReuse(candidates, title, ids.toSet())) {
             is FolderReuseDecision.ReuseExistingLink -> {
                 val links = runCatching {
-                    client.send(TdApi.GetChatFolderInviteLinks(decision.folderId)).inviteLinks
+                    sendReq(TdApi.GetChatFolderInviteLinks(decision.folderId)).inviteLinks
                 }.getOrDefault(emptyArray())
                 // 链接即礼包：同集合的既有链接直接返回，零新增写（名字用链接自己的，
                 // 展示诚实——那是这个合集在服务端的真名）
@@ -2202,7 +2243,7 @@ class TdLibGateway(
         // 遗孤收编：普通夹转可分享（与主路同款回执口径——错误只记日志不阻断）
         if (needConvert) {
             runCatching {
-                client.send(
+                sendReq(
                     TdApi.EditChatFolder(
                         folderId,
                         TdApi.ChatFolder(
@@ -2222,7 +2263,7 @@ class TdLibGateway(
         // 在既有夹上导出（服务端转换落定时序同主路：小步重试 ×3 兜抖动）
         for (attempt in 1..3) {
             val got = runCatching {
-                client.send(TdApi.CreateChatFolderInviteLink(folderId, title, ids.toLongArray()))
+                sendReq(TdApi.CreateChatFolderInviteLink(folderId, title, ids.toLongArray()))
             }.onFailure { Log.i(TAG, "频道礼包查重·复用导出第${attempt}次被拒（诊断）：${it.message}") }
                 .getOrNull()
             if (got != null && !got.inviteLink.isNullOrBlank()) {
@@ -2257,14 +2298,14 @@ class TdLibGateway(
             chatFolderInfos
                 .filter { info -> (info.name?.text?.text ?: "").startsWith(testFolderPrefix) }
                 .mapNotNull { info ->
-                    val f = runCatching { client.send(TdApi.GetChatFolder(info.id)) }.getOrNull()
+                    val f = runCatching { sendReq(TdApi.GetChatFolder(info.id)) }.getOrNull()
                     TestFolderSnapshot(
                         folderId = info.id,
                         name = info.name?.text?.text ?: "",
                         chatCount = f?.let { (it.pinnedChatIds.toList() + it.includedChatIds.toList()).distinct().size } ?: -1,
                         isShareable = info.isShareable,
                         inviteLinkCount = if (info.hasMyInviteLinks) {
-                            runCatching { client.send(TdApi.GetChatFolderInviteLinks(info.id)).inviteLinks?.size ?: 0 }
+                            runCatching { sendReq(TdApi.GetChatFolderInviteLinks(info.id)).inviteLinks?.size ?: 0 }
                                 .getOrDefault(0)
                         } else 0,
                     )
@@ -2293,13 +2334,13 @@ class TdLibGateway(
         }
         return runCatching {
             val links = runCatching {
-                client.send(TdApi.GetChatFolderInviteLinks(folderId)).inviteLinks
+                sendReq(TdApi.GetChatFolderInviteLinks(folderId)).inviteLinks
             }.getOrDefault(emptyArray())
             links.forEach { link ->
-                runCatching { client.send(TdApi.DeleteChatFolderInviteLink(folderId, link.inviteLink)) }
+                runCatching { sendReq(TdApi.DeleteChatFolderInviteLink(folderId, link.inviteLink)) }
                     .onFailure { Log.w(TAG, "清理工具·删链接失败 folderId=$folderId: ${it.message}") }
             }
-            client.send(TdApi.DeleteChatFolder(folderId, LongArray(0)))
+            sendReq(TdApi.DeleteChatFolder(folderId, LongArray(0)))
             Log.i(TAG, "清理工具·已删测试文件夹 folderId=$folderId（先清链接 ${links.size} 条；未退任何频道）")
             true
         }.onFailure {
@@ -2333,14 +2374,14 @@ class TdLibGateway(
             return ChannelPackJoin.Failed("账号写保护开启中（测试模式），整包收下已拦下")
         }
         return runCatching {
-            val info = client.send(TdApi.CheckChatFolderInviteLink(inviteLink))
+            val info = sendReq(TdApi.CheckChatFolderInviteLink(inviteLink))
             val folderName = info.chatFolderInfo?.name?.text?.text?.takeIf { it.isNotBlank() } ?: "频道礼包"
             val missing = info.missingChatIds?.toList().orEmpty()
             if (missing.isEmpty()) {
                 Log.d(TAG, "频道礼包整包收下：频道此前已全部收下 合集=$folderName link=$inviteLink")
                 return@runCatching ChannelPackJoin.Joined(folderName, 0)
             }
-            client.send(TdApi.AddChatFolderByInviteLink(inviteLink, missing.toLongArray()))
+            sendReq(TdApi.AddChatFolderByInviteLink(inviteLink, missing.toLongArray()))
             Log.i(TAG, "频道礼包整包收下完成：合集=$folderName 新收=${missing.size} link=$inviteLink")
             ChannelPackJoin.Joined(folderName, missing.size)
         }.getOrElse {
@@ -2359,13 +2400,13 @@ class TdLibGateway(
     suspend fun peekChannelPack(inviteLink: String): ChannelPackPreview? {
         runCatching { awaitAuthorized() }.onFailure { return null }
         return runCatching {
-            val info = client.send(TdApi.CheckChatFolderInviteLink(inviteLink))
+            val info = sendReq(TdApi.CheckChatFolderInviteLink(inviteLink))
             val folderName = info.chatFolderInfo?.name?.text?.text?.takeIf { it.isNotBlank() } ?: "频道礼包"
             val added = info.addedChatIds?.toList().orEmpty()
             // missing+added 合并去重（与 harvestChatFolderInviteImpl 同口径），missing 在前
             val ids = (info.missingChatIds?.toList().orEmpty() + added).distinct()
             val channels = ids.map { id ->
-                val title = runCatching { client.send(TdApi.GetChat(id)).title }.getOrNull()
+                val title = runCatching { sendReq(TdApi.GetChat(id)).title }.getOrNull()
                     ?.takeIf { it.isNotBlank() }
                     ?: peekChatTitle(id)
                     ?: "未知频道"
@@ -2856,7 +2897,10 @@ class TdLibGateway(
             if (!f.local.isDownloadingCompleted || f.local.path.isEmpty() ||
                 !java.io.File(f.local.path).isFile
             ) {
-                f = client.send(TdApi.GetFile(size.photo.id))
+                // R435：GetFile 过 sendReq 10s 超时（R169 F1 家族；后续 DownloadFile
+                // 既有 withTimeout(MSG_COVER_TIMEOUT_MS) 不动）——快拍封面在本会话
+                // 快拍条渲染路径上，超时=普通失败异常，runCatching 照旧静默回落 null
+                f = sendReq(TdApi.GetFile(size.photo.id))
                 if (!f.local.isDownloadingCompleted || f.local.path.isEmpty()) {
                     f = withTimeout(MSG_COVER_TIMEOUT_MS) {
                         client.send(TdApi.DownloadFile(size.photo.id, 32, 0L, 0L, true))

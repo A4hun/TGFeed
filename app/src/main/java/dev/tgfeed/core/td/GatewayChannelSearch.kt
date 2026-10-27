@@ -46,9 +46,7 @@ internal suspend fun TdLibGateway.expandAlbumMembersImpl(
     if (albumId == 0L) return emptyList()
     return runCatching {
         awaitAuthorized()
-        val around = withTimeout(10_000) {
-            client.send(TdApi.GetChatHistory(chatId, anchorMessageId, -10, 21, false))
-        }
+        val around = sendReq(TdApi.GetChatHistory(chatId, anchorMessageId, -10, 21, false))
         val siblings = around.messages.filterNotNull()
             .filter { it.mediaAlbumId == albumId }
         // 相册共享 caption 补全（修"合集成员播放页只剩频道名"，与搜索展开同款）：
@@ -198,9 +196,7 @@ internal suspend fun TdLibGateway.searchChannelAllImpl(chatId: Long, query: Stri
                     expandSem.withPermit {
                         runCatching {
                             // 拉锚点附近的窗口，把同 mediaAlbumId 的兄弟成员都展开
-                            val around = withTimeout(10_000) {
-                                client.send(TdApi.GetChatHistory(chatId, anchorId, -8, 16, false))
-                            }
+                            val around = sendReq(TdApi.GetChatHistory(chatId, anchorId, -8, 16, false))
                             val siblings = around.messages.filterNotNull()
                                 .filter { it.mediaAlbumId == albumId }
                             // 相册共享 caption 补全（修"相册条目播放页只剩频道名"）：
@@ -237,9 +233,7 @@ internal suspend fun TdLibGateway.searchChannelAllImpl(chatId: Long, query: Stri
                             // "更新"的 6 条（说明之后发的无关消息），关联方向反了，展开的媒体
                             // 既关联不到说明、还白占了展开名额。offset=0 从文字帖往旧取 7 条
                             //（文字帖 + 紧随的 6 条媒体批），与 fetchFromChannel 页内语义一致
-                            val around = withTimeout(10_000) {
-                                client.send(TdApi.GetChatHistory(chatId, textMsg.id, 0, 7, false))
-                            }
+                            val around = sendReq(TdApi.GetChatHistory(chatId, textMsg.id, 0, 7, false))
                             // 批注帖正文：展开的空 caption 媒体拿它当关联说明
                             //（Feed 形态B 同款语义；旧实现展开成员 caption 为空，
                             //  播放页信息区只剩频道名）
@@ -310,14 +304,12 @@ internal suspend fun TdLibGateway.searchChannelCommentsImpl(chatId: Long, query:
         // 候选主帖 messageId 去重保序（先全文搜命中、再最近帖）
         val candidates = LinkedHashSet<Long>()
         runCatching {
-            client.send(
-                TdApi.SearchChatMessages(chatId, null, q, null, 0L, 0, SEARCH_COMMENT_POST_SCAN, null)
-            )
+            sendReq(TdApi.SearchChatMessages(chatId, null, q, null, 0L, 0, SEARCH_COMMENT_POST_SCAN, null))
         }.getOrNull()?.messages?.filterNotNull()?.forEach { m ->
             if ((m.interactionInfo?.replyInfo?.replyCount ?: 0) > 0) candidates += m.id
         }
         runCatching {
-            client.send(TdApi.GetChatHistory(chatId, 0L, 0, SEARCH_COMMENT_RECENT_SCAN, false))
+            sendReq(TdApi.GetChatHistory(chatId, 0L, 0, SEARCH_COMMENT_RECENT_SCAN, false))
         }.getOrNull()?.messages?.filterNotNull()?.forEach { m ->
             if ((m.interactionInfo?.replyInfo?.replyCount ?: 0) > 0) candidates += m.id
         }
@@ -327,7 +319,7 @@ internal suspend fun TdLibGateway.searchChannelCommentsImpl(chatId: Long, query:
         for (mid in candidates.take(SEARCH_COMMENT_MAX_THREADS)) {
             if (out.size >= limit) break
             val history = runCatching {
-                client.send(TdApi.GetMessageThreadHistory(chatId, mid, 0L, 0, SEARCH_COMMENT_THREAD_LIMIT))
+                sendReq(TdApi.GetMessageThreadHistory(chatId, mid, 0L, 0, SEARCH_COMMENT_THREAD_LIMIT))
             }.getOrNull() ?: continue // 单线程失败静默跳过（flood/关评论/无权限）
             // 评论区相册共享 caption（形态A，与 fetchCommentVideos 同口径）：
             // 空 caption 的相册回复补共享文案后再过本地 query 过滤——补进来的文案
@@ -576,7 +568,7 @@ internal suspend fun TdLibGateway.searchPublicPostsImpl(query: String, offset: S
     val q = query.trim()
     require(q.isNotEmpty()) { "巡逻关键词为空" }
     awaitAuthorized()
-    val found = client.send(TdApi.SearchPublicPosts(q, offset, limit.coerceIn(1, 100), 0L))
+    val found = sendReq(TdApi.SearchPublicPosts(q, offset, limit.coerceIn(1, 100), 0L))
     // 配额快照 + 日志（红线：配额透明；searchLimits 为 JNI 平台类型，防御 null）
     val limits = found.searchLimits
     if (limits != null) {

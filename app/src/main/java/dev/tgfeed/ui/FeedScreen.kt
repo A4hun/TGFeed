@@ -660,7 +660,11 @@ fun FeedScreen(
         // 与 R180 导航闸同一语义（navPausedVideoKeys/navPausedAudio 记账恢复）
         var bgPausedVideoKey: String? = null
         var bgPausedAudio = false
-        appContainer.currentPlayerPauser = {
+        // R437 H2/H7：四槽先落局部 val 再注册——dispose 只清自己注册的实例（===
+        // 守卫，GridScreen:1724-1728 先例）：when 分支切换（viewMode 切分屏等）时
+        // 新页先注册、旧 FeedScreen 的 dispose 晚到，无条件置 null 会把新页的
+        // 注册一并抹掉（覆盖页在位期间的暂停/续播/进度落盘/取条全失效）
+        val pauser: () -> Unit = {
             val key = vm.items.value.getOrNull(vm.currentIndex.value)?.key
             // 一刀切暂停整池：池内可同时存在多路 busy（翻页在途旧页未收/邻页残留），
             // 只按 currentIndex 暂停一路会漏音——实测后台仍有另一路 AudioTrack 处于 started。
@@ -676,10 +680,12 @@ fun FeedScreen(
             )
             bgPausedVideoKey = if (wasPlaying) key else null
             // 共享音频播放器同步拉停（音频卡划出销毁后 currentPlayerPauser 原本够不到它）
-            bgPausedAudio = audioPlayer.isPlaying
+            // R437 H4：判定用 playWhenReady 而非 isPlaying（对齐 :675 视频侧口径）——
+            // 缓冲中音频 isPlaying=false 但用户语义在播，回前台应续播
+            bgPausedAudio = audioPlayer.playWhenReady
             if (bgPausedAudio) audioPlayer.pause()
         }
-        appContainer.currentPlayerResumer = {
+        val resumer: () -> Unit = {
             // 恢复前校验目标仍是当前条（切源/切条过就不回放旧声音，与主页闸同口径）
             bgPausedVideoKey?.let { k ->
                 if (vm.items.value.getOrNull(vm.currentIndex.value)?.key == k) {
@@ -694,12 +700,12 @@ fun FeedScreen(
         }
         // 记忆播放：退后台（onStop）时同步落盘当前条进度——杀进程前的最后保存机会，
         // 必须走 saveProgressSync 当场写盘（异步落盘可能在进程被杀前来不及执行）
-        appContainer.currentProgressSaver = {
+        val progressSaver: () -> Unit = {
             val item = vm.items.value.getOrNull(vm.currentIndex.value)
             val pos = item?.let { playerPool.peek(it.key)?.currentPosition }
             if (item != null && pos != null) vm.saveProgressSync(item, pos)
         }
-        appContainer.currentItemProvider = {
+        val itemProvider: () -> dev.tgfeed.core.td.VideoItem? = {
             // 音频接管媒体会话期间（共享音频播放器为主位且装有音频条目）：
             // 元数据锁定在播音频——锁屏/通知显示歌名·歌手而不是当前浏览页；
             // 其余情况回当前页条目（视频场景原行为）。mediaId=item.key 是音频卡的归属约定
@@ -711,11 +717,17 @@ fun FeedScreen(
             }
             parkedAudio ?: vm.items.value.getOrNull(vm.currentIndex.value)
         }
+        appContainer.currentPlayerPauser = pauser
+        appContainer.currentPlayerResumer = resumer
+        appContainer.currentProgressSaver = progressSaver
+        appContainer.currentItemProvider = itemProvider
         onDispose {
-            appContainer.currentPlayerPauser = null
-            appContainer.currentPlayerResumer = null
-            appContainer.currentProgressSaver = null
-            appContainer.currentItemProvider = null
+            // R437 H2/H7：只注销自己注册的（=== 比较）——防分支切换时晚到的 dispose
+            // 清掉别页（分屏 GridScreen 等）刚注册上的实例
+            if (appContainer.currentPlayerPauser === pauser) appContainer.currentPlayerPauser = null
+            if (appContainer.currentPlayerResumer === resumer) appContainer.currentPlayerResumer = null
+            if (appContainer.currentProgressSaver === progressSaver) appContainer.currentProgressSaver = null
+            if (appContainer.currentItemProvider === itemProvider) appContainer.currentItemProvider = null
         }
     }
 
