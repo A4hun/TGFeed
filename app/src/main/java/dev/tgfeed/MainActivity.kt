@@ -36,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import dev.tgfeed.core.td.GatewayState
+import dev.tgfeed.core.feed.visibilityGate
 import dev.tgfeed.ui.AuthScreen
 import dev.tgfeed.ui.FeedScreen
 import dev.tgfeed.ui.theme.TgFeedTheme
@@ -652,6 +653,10 @@ class MainActivity : ComponentActivity() {
                 // R222 hashtag 时间轴页（caption #标签双选弹层「时间轴探索」进）
                 val showHashtagTimeline by container.showHashtagTimeline.collectAsState()
                 val showPlaylists by container.showPlaylists.collectAsState()
+                // R387 播放队列（节目单）页（镜像 showPlaylists 的状态驱动路由）
+                val showPlayQueue by container.showPlayQueue.collectAsState()
+                // R391 播放台列表页（多队列管理面；单台编辑页 showPlayQueue 的宿主）
+                val showQueueStations by container.showQueueStations.collectAsState()
                 val showSearch by container.showSearch.collectAsState()
                 val channelHome by container.showChannelHome.collectAsState()
                 // 系统画中画态：true 时悬浮层切"满窗纯视频"（藏全部 UI 控件/进度条/按钮）
@@ -702,6 +707,7 @@ class MainActivity : ComponentActivity() {
                 )
                 val overlayPageOpen = showSettings || showAbout || showDownloads || showWatchReport ||
                     showChannelHealth || showTasteMap || showWatchHistory || showPlaylists ||
+                    showPlayQueue || showQueueStations ||
                     showSearch || showFavorites || showEventResearch || showOnThisDay ||
                     showTimeMachine || showHashtagTimeline || channelHome != null
                 val barVisible = dev.tgfeed.ui.resolveBottomBarVisible(
@@ -723,10 +729,23 @@ class MainActivity : ComponentActivity() {
                 //    整层覆盖——播放让位归 R180 navGate 既有机制：组合着但非激活=暂停+记账，
                 //    关层回 tab 抬闸续播，与滑去发现页同一语义）。LaunchedEffect 键控写入：
                 //    状态翻转后一帧内生效。
-                val feedActive = showFeed && viewMode == "feed" && barVisualPage == 0 &&
-                    !overlayPageOpen && channelHome == null && !container.homeTimelineOn.value
-                androidx.compose.runtime.LaunchedEffect(feedActive) {
+                // R417：收敛为播放占有权仲裁（core/playback/PlaybackOwnership 纯函数）——
+                // feedActive 由持有者同源派生（== FEED），分屏池同读 playbackOwner
+                val playbackOwner = dev.tgfeed.core.playback.resolvePlaybackOwner(
+                    dev.tgfeed.core.playback.PlaybackOwnershipSnapshot(
+                        showFeed = showFeed,
+                        viewMode = viewMode,
+                        topLevelPage = barVisualPage,
+                        subPageOpen = overlayPageOpen && channelHome == null,
+                        channelHomeOpen = channelHome != null,
+                        timelineOn = container.homeTimelineOn.value,
+                    ),
+                )
+                val feedActive = playbackOwner == dev.tgfeed.core.playback.PlaybackOwner.FEED
+                androidx.compose.runtime.LaunchedEffect(playbackOwner) {
+                    container.playbackOwner.value = playbackOwner
                     container.feedPageActive.value = feedActive
+                    android.util.Log.i("R417 占有权", "路由切换 owner=${playbackOwner.name}")
                 }
                 // 底栏让位高度：显隐同拍同曲线（220ms emphasized tween，§5.2「底栏显隐」行）。
                 // 分屏模式（viewMode=grid）由 topLevelRoute=null → 恒 0（任务书裁决默认值）
@@ -1107,6 +1126,8 @@ class MainActivity : ComponentActivity() {
                     dev.tgfeed.ui.PursueScreen(
                         gateway = gateway,
                         deepIndex = feedVmForTabs?.deepIndex,
+                        // R418 时间线共享可见性谓词（屏蔽频道/不感兴趣/关键词）
+                        visibility = { feedVmForTabs?.visibilityGate() },
                         pageActive = feedPageActive,
                         onSelectFollowing = {
                             container.homeTimelineOn.value = false
@@ -1414,6 +1435,9 @@ class MainActivity : ComponentActivity() {
                         onOpenSettings = { container.openConfig() },
                         onOpenDownloads = { container.openDownloads() },
                         onOpenPlaylists = { container.openPlaylists() },
+                        // R391 播放台列表页入口（一期「播放队列」行的二期升级位：
+                        // 多套节目单管理面+今日台生成；编辑面=台列表页内嵌跳转）
+                        onOpenPlayQueue = { container.openQueueStations() },
                         // R199 我的收藏页入口（收藏查看模块；计数徽章数据在页内取共享 VM）
                         onOpenFavorites = { container.openFavorites() },
                         // R203 那年今日页入口（TL-2；时间回看语义组——观看历史旁）
@@ -1973,6 +1997,56 @@ class MainActivity : ComponentActivity() {
                     showPlaylists -> dev.tgfeed.ui.PlaylistsScreen(
                         gateway = gateway,
                         onBack = { container.closePlaylists() },
+                    )
+                    // R387 播放队列（节目单）页：播放/从头播 + 四档排序 chips + 拖拽
+                    // 编辑 + 加频道/稍后再看入单/清空（排 showPlaylists 之后、
+                    // showSettings 之前=R305 层级先例）。
+                    // R391 起本页=单台编辑页（编辑对象=活跃台；宿主=播放台列表页
+                    // showQueueStations——本分支排在台列表分支**之前**=嵌套覆盖页
+                    // 先于宿主匹配（showEventResearch 分支前 L1943 同款不变式），
+                    // 编辑页返回=剥落回台列表。
+                    showPlayQueue -> dev.tgfeed.ui.QueueScreen(
+                        gateway = gateway,
+                        onBack = { container.closePlayQueue() },
+                        // R414 开播落点：编辑页/台列表/我的页三层剥落回 Feed 连播
+                        // （旧件只关编辑页=落回台列表/我的页，用户实锤「跳到我的页」）
+                        onPlayStarted = {
+                            container.closePlayQueue()
+                            container.closeQueueStations()
+                            container.closeMine()
+                            container.showFeed()
+                        },
+                        // R397 批量入分屏（入口⑤·队列编辑面）：活跃台点名单条倒进分屏
+                        // ——编辑页/台列表/我的页三层剥落让路（grid 分支在 when 链
+                        // feed 分支内，压在其上的路由须先关）
+                        onBatchToGrid = { items ->
+                            container.closePlayQueue()
+                            container.closeQueueStations()
+                            container.closeMine()
+                            seedGridAndOpen("队列", items)
+                        },
+                    )
+                    // R391 播放台列表页：多套单卡片（名字/条目数/顺序档/最近动态）
+                    // + 一键开台（点击台卡=切源播单）+ 台 CRUD + 今日台生成钮
+                    // （#7 入口）。排 showPlayQueue 之后=宿主位（编辑页在前面分支
+                    // 压住本页时不匹配）；入口=我的页「播放台」行。
+                    showQueueStations -> dev.tgfeed.ui.QueueStationsScreen(
+                        gateway = gateway,
+                        onBack = { container.closeQueueStations() },
+                        onOpenStationEditor = { container.openPlayQueue() },
+                        // R414 开台落点：台列表/我的页剥落回 Feed 连播
+                        onStationStarted = {
+                            container.closeQueueStations()
+                            container.closeMine()
+                            container.showFeed()
+                        },
+                        // R397 批量入分屏（入口⑤·台卡行尾）：台内点名单条倒进分屏
+                        // ——台列表/我的页剥落让路（编辑页未开时无需关）
+                        onBatchToGrid = { items ->
+                            container.closeQueueStations()
+                            container.closeMine()
+                            seedGridAndOpen("播放台", items)
+                        },
                     )
                     // R205 事件研究器页（WK-3 时间维度高级研究；R215 起活口入口=设置页
                     // 高级区「时间维度工具」卡，发现页入口隐藏不删码）。

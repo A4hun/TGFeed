@@ -43,6 +43,7 @@ import androidx.compose.material.icons.outlined.NotInterested
 import androidx.compose.material.icons.outlined.PictureInPicture
 import androidx.compose.material.icons.outlined.PlaylistAdd
 import androidx.compose.material.icons.outlined.PlaylistPlay
+import androidx.compose.material.icons.outlined.QueueMusic
 import androidx.compose.material.icons.outlined.Repeat
 import androidx.compose.material.icons.outlined.RepeatOne
 import androidx.compose.material.icons.outlined.Schedule
@@ -220,6 +221,8 @@ internal fun VideoActionSheet(
     var showPlaylistPicker by remember { mutableStateOf(false) }
     // "屏蔽频道"确认对话框显隐（防误触：点动作先弹确认，确认才执行）
     var showBlockConfirm by remember { mutableStateOf(false) }
+    // R413 "屏蔽关键词"输入框显隐；输入由用户自填（刻意不从标题抽词预填）
+    var showKeywordMute by remember { mutableStateOf(false) }
     // FeedScreen 提供的"加入片单"外部处理器；null = 未提供，走面板内建兜底
     val externalAddToPlaylist = LocalAddToPlaylist.current
     // P3-g：面板本地 Toast 用的 Context（图/音面板"悬浮播放"置灰项的点击说明）
@@ -234,6 +237,19 @@ internal fun VideoActionSheet(
         } else {
             null
         }
+    } else {
+        null
+    }
+    // R387 加入队列内建兜底 VM：无宿主回调参数（VideoPage/FeedScreen 参数表冻结期
+    // 纪律——行 1 新格零参数面新增），面板自解共享 FeedViewModel（blockFallbackVm
+    // 同一招，同 key 取回 activity 作用域既有实例），目标=当前停留页条目
+    val queueApp = context.applicationContext as? android.app.Application
+    val queueGateway = (queueApp as? dev.tgfeed.App)?.container?.gateway?.value
+    val queueFallbackVm: FeedViewModel? = if (queueApp != null && queueGateway != null) {
+        viewModel(
+            factory = FeedViewModelFactory(queueGateway, queueApp),
+            key = "gw" + System.identityHashCode(queueGateway),
+        )
     } else {
         null
     }
@@ -296,6 +312,11 @@ internal fun VideoActionSheet(
                     SheetAction(
                         Icons.Outlined.Block, "屏蔽频道", Modifier.width(72.dp),
                         onClick = { showBlockConfirm = true },
+                    )
+                    // R413 屏蔽关键词：弹输入框，确认即生效（推荐/关注/搜索全链过滤，当前列表即时剔除）
+                    SheetAction(
+                        Icons.Outlined.VisibilityOff, "屏蔽关键词", Modifier.width(72.dp),
+                        onClick = { showKeywordMute = true },
                     )
                     SheetAction(Icons.Outlined.FileDownload, "缓存视频", Modifier.width(72.dp), onCache)
                     // P3-g/B13：图/音面板（按 P0-1 约定 onToggleMute==null 即图/音宿主）没有视频可悬浮——
@@ -418,6 +439,32 @@ internal fun VideoActionSheet(
                                 // 内建兜底：选择器渲染在本面板尾部，本面板必须留在组合里，不能先关
                                 showPlaylistPicker = true
                             }
+                        },
+                    )
+                    // R387 加入队列（「稍后再看入单」的 feed 腿——r387_notes §3.2：刷到即
+                    // 存队列按序播；与既有「稍后再看」两系统并存不互斥）：无宿主回调参数
+                    //（参数表冻结期纪律），内建兜底 VM 自解共享实例，目标=当前停留页条目
+                    //（长按面板只可能出现在可见页，实践中即 settled page=长按的那张卡——
+                    // 屏蔽频道兜底同款口径）；幂等分流 Toast（同 key 已在单不重复入）
+                    SheetAction(
+                        Icons.Outlined.QueueMusic, "加入队列", Modifier.width(72.dp),
+                        onClick = {
+                            val vm = queueFallbackVm
+                            val target = vm?.items?.value?.getOrNull(vm.currentIndex.value)
+                            when {
+                                vm == null || target == null -> android.widget.Toast.makeText(
+                                    context, "当前没有可入单的条目", android.widget.Toast.LENGTH_SHORT,
+                                ).show()
+                                else -> {
+                                    val added = vm.enqueueItemToPlayQueue(target)
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        if (added) "已加入播放队列" else "已在播放队列里",
+                                        android.widget.Toast.LENGTH_SHORT,
+                                    ).show()
+                                }
+                            }
+                            onDismiss()
                         },
                     )
                     // B3：滚动末尾呼吸位（配合外层 Column horizontal=20dp 内边距，内容两端均不贴屏幕边）
@@ -622,6 +669,52 @@ internal fun VideoActionSheet(
     // 渲染在本面板尾部 → 选择器期间本面板保持打开，选完/取消后回到本面板）
     if (showPlaylistPicker) {
         AddToPlaylistSheet(onDismiss = { showPlaylistPicker = false })
+    }
+
+    // R413 "屏蔽关键词"输入对话框：共享 VM（queueFallbackVm 同 key 取回 activity 作用域实例）
+    if (showKeywordMute) {
+        var kw by remember { mutableStateOf("") }
+        val submitKw: () -> Unit = {
+            val vm = queueFallbackVm
+            if (vm == null) {
+                android.widget.Toast.makeText(context, "当前无法屏蔽关键词", android.widget.Toast.LENGTH_SHORT).show()
+            } else {
+                val err = vm.addMutedKeyword(kw) { n ->
+                    android.widget.Toast.makeText(context, "已屏蔽 $n 条", android.widget.Toast.LENGTH_SHORT).show()
+                }
+                if (err != null) {
+                    android.widget.Toast.makeText(context, err, android.widget.Toast.LENGTH_SHORT).show()
+                } else {
+                    showKeywordMute = false
+                    onDismiss()
+                }
+            }
+        }
+        AlertDialog(
+            onDismissRequest = { showKeywordMute = false },
+            title = { Text("屏蔽关键词") },
+            text = {
+                Column {
+                    Text(
+                        "含该词的内容将不再出现在推荐、关注流与搜索中，可在设置→关键词屏蔽里管理",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    OutlinedTextField(
+                        value = kw,
+                        onValueChange = { kw = it.take(dev.tgfeed.core.feed.KeywordMutePolicy.MAX_LEN + 10) },
+                        singleLine = true,
+                        placeholder = { Text("输入关键词") },
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = submitKw, enabled = kw.isNotBlank()) { Text("屏蔽") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showKeywordMute = false }) { Text("取消") }
+            },
+        )
     }
 
     // "屏蔽频道"确认对话框（防误触）：渲染在本面板尾部，弹窗期间面板保持打开，取消即回面板。

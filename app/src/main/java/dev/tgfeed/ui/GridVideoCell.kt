@@ -107,7 +107,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.State
 import androidx.compose.runtime.snapshots.Snapshot
+import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
@@ -247,14 +249,18 @@ internal fun GridVideoCell(
     // true = 首屏格（fade+scale+translateY 完整入场）；false = 分页格（仅 200ms 淡入）
     entranceFull: Boolean,
     focused: Boolean,
-    volume: Float,
+    // R432 重组收敛：每格音量记忆表（SnapshotStateMap 本体下传，本格叶子内按 slotId
+    // 现查）——音量拖动每帧写表不再把外层画布循环拖进重组，只重组本格
+    volumes: SnapshotStateMap<String, Float>,
     muteAll: Boolean,
     // R230 ⑥ 手动播放授权口：两步制第二步（焦点格再点=开播）与失败格重试都经它
     // 向外层申请播放授权（满 MAX_GRID_PLAYERS 路时外层 Toast 拒绝并返回 false）
     onRequestPlay: () -> Boolean,
-    liked: Boolean,
-    favorited: Boolean,
-    downloadStatus: DownloadStatus?,
+    // R432 重组收敛：点赞/收藏/下载三表 State 本体下传，本格叶子内按 item.key 现查
+    // （订阅作用域=本格）——下载 1Hz 进度更新只重组在读表的单格，不再全视口重组
+    likes: State<Set<String>>,
+    favorites: State<Set<String>>,
+    downloads: State<Map<String, DownloadStatus>>,
     watched: Boolean,
     // 分屏 LOD：true = 格子视觉短边已缩到 80dp 以下，chrome 全隐（×钮/音量线/
     // 频道名行/已看弱化/焦点环/声波都不画），只留纯画面；
@@ -294,6 +300,12 @@ internal fun GridVideoCell(
 ) {
     // 池内 key 按槽位（加前缀避免与 Feed 模式冲突）：换片不换格，播放器原位复用
     val poolKey = "grid:$slotId"
+    // R432 重组收敛：三表 + 音量表的叶子查表点（组合期单次读，语义与旧值参链一致——
+    // 旧链在外层循环取值后传入，本格组合时读到的就是同一快照值）
+    val liked = item.key in likes.value
+    val favorited = item.key in favorites.value
+    val downloadStatus = downloads.value[item.key]
+    val volume = volumes[slotId] ?: 1f
     // R80：自带地址先过收口判定（含 '#'/'?' 的裸路径置 null 走 ensurePlayable 换流地址）
     var playUri by remember(item.key) { mutableStateOf(item.safeInitialPlayUri()) }
     var buffering by remember(item.key) { mutableStateOf(true) }

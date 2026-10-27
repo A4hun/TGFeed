@@ -67,8 +67,93 @@ internal const val PK_CELL_W = 2
 /** PK 擂台模式：单格占的画布单元行数（2 行高的大格，画布总行数固定为它） */
 internal const val PK_CELL_H = 2
 
-/** 画布逻辑格位：以单元为单位的整数矩形（x/y = 列/行，w/h = 占格数） */
-internal data class CellRect(val x: Int, val y: Int, val w: Int, val h: Int)
+/**
+ * 画布逻辑格位：以单元为单位的矩形（x/y = 列/行，w/h = 占格数）。
+ * R415：字段改 Float 以承载按行装箱（[justifiedLayout]）的分数格位；
+ * 旧等分流式排位 / PK 钉位仍走 Int 次构造（值恒为整数）。
+ */
+internal data class CellRect(val x: Float, val y: Float, val w: Float, val h: Float) {
+    constructor(x: Int, y: Int, w: Int, h: Int) : this(x.toFloat(), y.toFloat(), w.toFloat(), h.toFloat())
+}
+
+// ==================== R415 按行装箱（justified rows） ====================
+
+/** 装箱宽高比钳制下限（超竖内容最窄按 1:2 计，防竖条格过窄） */
+internal const val JUSTIFY_MIN_ASPECT = 0.5f
+
+/** 装箱宽高比钳制上限（超宽内容最宽按 2.4:1 计，防横条格独占一行仍过扁） */
+internal const val JUSTIFY_MAX_ASPECT = 2.4f
+
+/** 无尺寸信息（0 或负）时的回落宽高比：按主流横版 16:9 计 */
+internal const val JUSTIFY_DEFAULT_ASPECT = 16f / 9f
+
+/** 目标行高（单元数）：行高在此附近自适应，与旧 1×1 单元密度同档 */
+internal const val JUSTIFY_TARGET_ROW_H = 1f
+
+/** 像素宽高比 → 装箱用宽高比（无尺寸回落默认、极端值钳制，一处定义） */
+internal fun justifyAspect(width: Int, height: Int): Float =
+    if (width <= 0 || height <= 0) {
+        JUSTIFY_DEFAULT_ASPECT
+    } else {
+        (width.toFloat() / height).coerceIn(JUSTIFY_MIN_ASPECT, JUSTIFY_MAX_ASPECT)
+    }
+
+/**
+ * 按行装箱纯函数：按槽位顺序把内容逐行排进 [cols] 单元宽的画布，同行等高，
+ * 行内宽度按各自宽高比分配，行高自适应使整行恰好填满画布宽。
+ * 贪心收行：加入一条后行高 ≤ [targetRowH] 即收行，若"不加这条"的行高更接近目标
+ * 则这条挪到下一行。尾行（未凑满）不拉伸：按目标行高、左对齐。
+ * [cellAspect] = 单元像素宽/高（竖屏 1，横屏扁格 16/10），用于把像素宽高比换算到单元坐标。
+ * 返回 槽位id→格位 与 画布总行数（向上取整）。
+ */
+internal fun justifiedLayout(
+    slotIds: List<String>,
+    aspects: Map<String, Float>,
+    cols: Int,
+    cellAspect: Float = 1f,
+    targetRowH: Float = JUSTIFY_TARGET_ROW_H,
+): Pair<Map<String, CellRect>, Int> {
+    val result = LinkedHashMap<String, CellRect>()
+    val width = cols.toFloat()
+    // 行高（单元）= 画布宽 × 单元宽高比 ÷ 行内宽高比之和
+    fun rowH(sum: Float): Float = width * cellAspect / sum
+    var y = 0f
+    val row = ArrayList<Pair<String, Float>>()
+    var sum = 0f
+    fun emit(h: Float) {
+        var x = 0f
+        for ((id, a) in row) {
+            val w = a * h / cellAspect
+            result[id] = CellRect(x, y, w, h)
+            x += w
+        }
+        y += h
+        row.clear()
+        sum = 0f
+    }
+    for (id in slotIds) {
+        val a = (aspects[id] ?: JUSTIFY_DEFAULT_ASPECT).coerceIn(JUSTIFY_MIN_ASPECT, JUSTIFY_MAX_ASPECT)
+        val withH = rowH(sum + a)
+        if (withH > targetRowH) {
+            row += id to a
+            sum += a
+            continue
+        }
+        if (row.isNotEmpty() && kotlin.math.abs(rowH(sum) - targetRowH) < kotlin.math.abs(withH - targetRowH)) {
+            emit(rowH(sum))
+            row += id to a
+            sum = a
+            if (rowH(sum) <= targetRowH) emit(rowH(sum))
+        } else {
+            row += id to a
+            sum += a
+            emit(withH)
+        }
+    }
+    if (row.isNotEmpty()) emit(targetRowH)
+    val total = kotlin.math.ceil(y - 1e-3f).toInt().coerceAtLeast(if (result.isEmpty()) 0 else 1)
+    return result to total
+}
 
 /**
  * 流式排位：按槽位顺序把每条的 spanW×spanH 矩形放进固定 [cols] 列宽的画布，

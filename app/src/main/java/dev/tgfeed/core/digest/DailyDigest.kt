@@ -121,14 +121,16 @@ class DailyDigest(
     /**
      * 统计订阅频道今日新索引条数（纯读，IO 线程）：
      * chatId 分块拼 IN（块内 ≤500，远离老设备 999 占位符上限）。
-     * 句柄以读写模式打开仅为兼容 WAL 恢复需建 -shm 的场景——本模块只发 SELECT，绝不写库。
+     * R428 改 OPEN_READONLY：本模块只发 SELECT 绝不写库，与 FeedFirstSeenPart
+     * 首发溯源同库（deepindex/search.db）只读句柄同款——只读句柄绝不触发
+     * WAL 恢复/建 -shm 的写路径，也杜绝误写风险。
      */
     private fun countTodayNewItems(sinceEpochSec: Long): Int {
         val chatIds = loadSubscribedChatIds()
         if (chatIds.isEmpty()) return 0
         val dbFile = File(context.filesDir, "deepindex/search.db")
         if (!dbFile.isFile) return 0 // 索引从未建立：不开库不建库（同 DeepSearchIndex.hasIndex 口径）
-        val db = SQLiteDatabase.openDatabase(dbFile.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
+        val db = SQLiteDatabase.openDatabase(dbFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
         try {
             var total = 0
             // R266 v11 双臂（D4 现状口径：每次转发各计一份——今日新转发也算新内容）：

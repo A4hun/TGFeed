@@ -56,12 +56,19 @@ internal fun FeedViewModel.refreshIndexStatus(totalChats: Int = 0, building: Boo
  */
 internal fun FeedViewModel.autoBuildDeepIndex() {
     if (!autoIndexStarted.compareAndSet(false, true)) return
-    viewModelScope.launch(Dispatchers.IO) {
-        if (!dev.tgfeed.core.prefs.AppPrefs(app).autoDeepIndex) {
-            refreshIndexStatus() // 没开也显示现状
-            return@launch
-        }
-        if (gateway is dev.tgfeed.core.td.MockTdGateway) return@launch
+    if (gateway is dev.tgfeed.core.td.MockTdGateway) return
+    // R419：管线交给监督者（异常/看门狗判死 → 退避重建；设置关掉后轮询等再开）
+    viewModelScope.launch(Dispatchers.IO) { superviseIndexPipelineImpl() }
+}
+
+/**
+ * R419 单次管线运行体（原 autoBuildDeepIndex 本体）：coroutineScope 收口——枚举拍、
+ * 派工的爬取协程全是本作用域子协程，管线被看门狗取消/异常结束时一并回收
+ * （不再有挂在 viewModelScope 上的孤儿爬取）。正常返回=设置关掉了自动索引。
+ */
+internal suspend fun FeedViewModel.runIndexPipelineOnceImpl(): Unit = kotlinx.coroutines.coroutineScope {
+    val pipelineScope = this
+    run {
         // R208 开机风暴闸（P0 治理·时机闸）：系统开机静默期/负载退避持有中不
         // 起跑双节拍器——华为平板事故实锤：异常重启后 ROM 恢复前台应用，本调度
         // 器开机 73s 跑 72.6s=100% 占空比+7.3G 虚存，与系统开机风暴（load 35）
@@ -69,10 +76,31 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
         // 开 app 系统早已运行多小时→零延迟）+ /proc/loadavg 负载退避（零权限）。
         // **R158 语义零改动**：只延后起跑时机，起跑后的枚举/派工/预算/AIMD/
         // 退避全部照旧（派工侧另有一道同源闸兜底运行中风暴，见下方 stormHeld）。
-        dev.tgfeed.core.td.SystemStormGate.awaitClear("深索引双节拍器")
+        // R419：风暴闸等待期间维持心跳且标记闸持有（看门狗不误判 LOOP_STALLED）
+        val gateBeat = pipelineScope.launch {
+            while (true) {
+                indexPipeline.lastLoopTickMs = System.currentTimeMillis()
+                indexPipeline.held = true
+                delay(15_000L)
+            }
+        }
+        try {
+            dev.tgfeed.core.td.SystemStormGate.awaitClear("深索引双节拍器")
+        } finally {
+            gateBeat.cancel()
+        }
         // R191 索引调度器存活标记（起此终 finally）：点按「深度索引」时选建库路径——
         // 活着走优先车道（预算内插队），没跑走直接建库协程
         indexSchedulerAlive = true
+        // R419：爬取协程监督者（管线子作用域：单爬异常不连坐，管线结束统一回收）
+        val crawlSupervisor = kotlinx.coroutines.SupervisorJob(pipelineScope.coroutineContext[kotlinx.coroutines.Job])
+        val crawlScope = kotlinx.coroutines.CoroutineScope(pipelineScope.coroutineContext + crawlSupervisor + Dispatchers.IO)
+        // R419：首次起跑把钉住集合灌入手动车道（进程重启后钉住频道仍真插队续爬）
+        if (indexPipeline.pipelineStarts.incrementAndGet() == 1L) {
+            deepIndexPinnedChatIds.forEach { indexPipeline.manualLane.request(it) }
+        }
+        indexPipeline.lastLoopTickMs = System.currentTimeMillis()
+        indexPipeline.noteProgress()
         // 待爬队列（无界）：枚举 ticker 投喂、爬取 ticker 取餐；
         // queued（已入队未派工）/inFlight（在爬）双集合保证同一频道同时在飞最多一份
         val crawlQueue = kotlinx.coroutines.channels.Channel<Long>(kotlinx.coroutines.channels.Channel.UNLIMITED)
@@ -113,9 +141,11 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
             }
         }
         // ── 节拍器一：枚举（独立节奏刷新清单入队，不等爬取侧）──────────────
-        val enumJob = viewModelScope.launch(Dispatchers.IO) {
+        val enumJob = pipelineScope.launch(Dispatchers.IO) {
             while (true) {
                 if (!dev.tgfeed.core.prefs.AppPrefs(app).autoDeepIndex) break
+                // R419：单拍异常不杀枚举节拍器（记数+短歇重试；取消照常传播）
+                try {
                 // 全量索引覆盖频道+群组+私聊（与搜索同一口径 listSearchableChats；
                 // 只建频道的话群组里的内容永远不进索引）
                 val channels = runCatching {
@@ -244,6 +274,14 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
                         } ?: "") +
                         if (tiering.enabled) "｜分档开：落档 ${knownTiers.size} 个" else "",
                 )
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    indexPipeline.loopErrors.incrementAndGet()
+                    android.util.Log.w(R419_TAG, "enum_err=${t.javaClass.simpleName}")
+                    delay(INDEX_ROUND_RETRY_MS)
+                    continue
+                }
                 delay(INDEX_ROUND_INTERVAL_MS)
             }
         }
@@ -267,14 +305,22 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
                     "｜R163 分档=${if (indexTiering.enabled) "开" else "关"} " +
                     "智能时机=${if (crawlTiming.smartTiming) "开" else "关"}（默认全关=现状等效）",
             )
-            // 派工执行体（优先/巡游两车道共用）：评估落档 → 白嫖 → 档位化爬取
-            fun dispatchCrawl(chatId: Long) {
-                viewModelScope.launch(Dispatchers.IO) {
+            // 派工执行体（手动/优先/巡游车道共用）：评估落档 → 白嫖 → 档位化爬取
+            // R419：子协程挂在管线 supervisor 下（单个爬取异常不连坐管线，管线重建时一并回收）；
+            // 爬取本体走看护层（停滞/硬上限超时必释放槽位）；钉住频道无论从哪条车道出队都按手动口径收尾
+            fun dispatchCrawl(chatId: Long, manualLane: Boolean = false) {
+                val manual = manualLane || indexPipeline.manualLane.remove(chatId)
+                if (manual) indexPipeline.manualInFlight.incrementAndGet()
+                indexPipeline.dispatchedTotal.incrementAndGet()
+                indexPipeline.noteProgress()
+                crawlScope.launch {
+                    var outcome = CrawlOutcome.FAILED
+                    var aborted = false // R429：取消/异常路径标记（终态未达成，续排判定用）
                     try {
                         // R163 B4：派工前评估落档（分档开时；毫秒级只读聚合——每频道一次，
                         // 成本摊到派工自然节奏；评估升档 urgent 的走优先车道 M1/M9 路径；
                         // R191 钉住频道短路恒 T0）
-                        if (indexTiering.enabled) runCatching { evaluateAndSetTierImpl(chatId) }
+                        if (indexTiering.enabled || manual) runCatching { evaluateAndSetTierImpl(chatId) }
                         // R191 行内进度台账钩子（只有钉住频道有条目——全库常规爬取零扰动）
                         onManualIndexRowStartImpl(chatId)
                         // R46 方案 b：近期浏览频道先走本地缓存白嫖（onlyLocal 零网络，
@@ -286,23 +332,74 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
                         }
                         // R163 B4：分档配置透传（分档关=LEGACY 现状等效四路径）；
                         // R191：onProgress 接行台账（钉住频道行内「已索引 N 条」）
-                        runCatching { deepIndex.indexChannel(gateway, chatId, tiering = indexTiering) { n ->
-                            onManualIndexRowProgressImpl(chatId, n)
-                        } }
+                        outcome = guardedIndexChannelImpl(chatId, manual, crawlScope)
+                    } catch (t: Throwable) {
+                        // R429：取消（管线重建/看护复位取消 crawlScope）与任何异常路径——
+                        // 终态未达成，标记续排后原样上抛（取消语义/监督者回收不变）
+                        aborted = true
+                        throw t
                     } finally {
                         inFlight.remove(chatId)
+                        if (manual) indexPipeline.manualInFlight.decrementAndGet()
+                        indexPipeline.completedTotal.incrementAndGet()
+                        indexPipeline.noteProgress()
                         val doneN = doneTotal.incrementAndGet()
-                        if (doneN % 10 == 0) {
-                            refreshIndexStatus(lastEnumTotal, building = true)
+                        runCatching {
+                            if (doneN % 10 == 0) {
+                                refreshIndexStatus(lastEnumTotal, building = true)
+                            }
+                            // R419：手动频道没真跑完（超时/预算耗尽）→ 续排手动车道，行保持 building
+                            // R429：取消/异常/看护超时（aborted）也续排——管线重建取消在飞爬取时
+                            // outcome 停在 FAILED 初始值即丢（钉住频道卡死 building 的根因），一并续排
+                            val budgetOut = runCatching { crawlBudget.remaining() }.getOrDefault(1) <= 0
+                            val requeue = manual && chatId in deepIndexPinnedChatIds &&
+                                IndexPipelinePolicy.manualShouldRequeue(
+                                    timedOut = outcome == CrawlOutcome.TIMED_OUT,
+                                    budgetExhausted = budgetOut,
+                                    attemptsSoFar = indexPipeline.manualLane.attemptsOf(chatId),
+                                    aborted = aborted,
+                                )
+                            if (requeue) {
+                                indexPipeline.manualLane.requeue(chatId)
+                            } else if (!manual && indexPipeline.manualLane.contains(chatId)) {
+                                // 钉住前起跑的巡游浅爬结束：手动车道里还排着正式 T0 深挖，行保持 building
+                            } else {
+                                if (manual) indexPipeline.manualLane.forget(chatId)
+                                // R191 钉住行收尾（✓ 戳+终值计数；取消钉后收尾=台账回收）
+                                onManualIndexRowFinishedImpl(chatId)
+                            }
+                            syncForegroundService()
                         }
-                        // R191 钉住行收尾（✓ 戳+终值计数；取消钉后收尾=台账回收）
-                        onManualIndexRowFinishedImpl(chatId)
-                        syncForegroundService()
                     }
                 }
             }
             while (true) {
                 if (!dev.tgfeed.core.prefs.AppPrefs(app).autoDeepIndex) break // 设置已关：收尾退出
+                // R419：心跳（看门狗读）+ 积压量表（探针读）
+                indexPipeline.lastLoopTickMs = System.currentTimeMillis()
+                indexPipeline.backlogRoam.set(queued.size)
+                indexPipeline.backlogExplore.set(exploreQueued.size)
+                indexPipeline.backlogTtl.set(ttlUrgentQueued.size)
+                indexPipeline.inFlight.set(inFlight.size)
+                // ── R419 手动车道（用户钉住的频道）：独立派工槽，叠加在巡游并发之上——
+                // 真插队不等巡游槽；不受时机闸/风暴闸/探索配额约束，只受健康喊停。
+                // R429：预算硬限一并豁免（与优先车道 M1/M9 同口径——用户钉住是显式
+                // 意图、频次低且内部自会记账；否则预算干涸期钉住行整窗恒 building）。
+                // 取件跳过已在飞的（可能是钉住前起跑的浅爬，结束后再按 T0 重跑）
+                if (IndexPipelinePolicy.manualDispatchAllowed(
+                        dev.tgfeed.core.diag.AppHealthMonitor.crawlPaused(),
+                    )
+                ) {
+                    while (indexPipeline.manualInFlight.get() < IndexPipelinePolicy.MANUAL_LANE_SLOTS) {
+                        val id = indexPipeline.manualLane.takeNext { it in inFlight } ?: break
+                        if (!inFlight.add(id)) continue
+                        queued.remove(id)
+                        exploreQueued.remove(id)
+                        ttlUrgentQueued.remove(id)
+                        priorityQueuedSet.remove(id)
+                        dispatchCrawl(id, manualLane = true)
+                    }
+                }
                 // 并发 AIMD（参数口径不变 [4,8]）：每节拍比对 flood 计数，
                 // 无 flood +1 路（上限 8）、出 flood 降回 4
                 val nowTick = System.currentTimeMillis()
@@ -329,7 +426,7 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
                 // 与进程存活同级，watchdog 复位面前没有「用户在等」可言；解除即续派）
                 while (!dev.tgfeed.core.diag.AppHealthMonitor.crawlPaused() &&
                     dev.tgfeed.core.td.SystemStormGate.clearNow() &&
-                    inFlight.size < crawlConcurrency
+                    (inFlight.size - indexPipeline.manualInFlight.get()) < crawlConcurrency
                 ) {
                     val prio = priorityCrawlQueue.tryReceive().getOrNull() ?: break
                     if (!priorityQueuedSet.remove(prio)) continue // 已被巡游车道派工/作废
@@ -368,6 +465,7 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
                         l0WindowAccumMs = 0L
                     }
                     if (!IndexCrawlGate.roamingCrawlAllowed(inputs, timing)) {
+                        indexPipeline.held = true // R419：闸持有期零进展不算看门狗故障
                         syncForegroundService() // 在飞收尾后 FGS 自然摘牌
                         delay(1_000L) // 闸门挂起拍（用户在场/计量网络：一秒一判，开销可忽略）
                         continue
@@ -384,6 +482,7 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
                 // 恢复即续派）——与预算/健康同家族的第三道派工退避源（时机闸）
                 val stormHeld = !dev.tgfeed.core.td.SystemStormGate.clearNow()
                 val dispatchHeld = healthPaused || budgetLeft <= 0 || stormHeld
+                indexPipeline.held = dispatchHeld
                 if (dispatchHeld != dispatchHeldAnnounced) {
                     dispatchHeldAnnounced = dispatchHeld
                     android.util.Log.i(
@@ -399,7 +498,7 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
                 if (!dispatchHeld) {
                     // R284 时效优先车道先行（受时机闸/预算退避约束——后台维护语义，
                     // 不像优先车道那样用户在等；自毁内容不抢即永久消失=先于巡游/探索）
-                    while (inFlight.size < crawlConcurrency) {
+                    while ((inFlight.size - indexPipeline.manualInFlight.get()) < crawlConcurrency) {
                         val id = ttlUrgentQueue.tryReceive().getOrNull() ?: break
                         ttlUrgentQueued.remove(id)
                         queued.remove(id) // 跨车道去重：旧拷贝作废（时效判定随枚举拍刷新）
@@ -408,7 +507,7 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
                         if (!inFlight.add(id)) continue // 同频道已在爬，跳过防双爬
                         dispatchCrawl(id)
                     }
-                    while (inFlight.size < crawlConcurrency) {
+                    while ((inFlight.size - indexPipeline.manualInFlight.get()) < crawlConcurrency) {
                         val fromExplore = IndexCrawlGate.isExploreSlot(roamDispatchOrdinal.getAndIncrement(), timing) &&
                             exploreQueued.isNotEmpty()
                         val chatId = if (fromExplore) {
@@ -469,6 +568,7 @@ internal fun FeedViewModel.autoBuildDeepIndex() {
                 delay(IndexCrawlGate.dispatchTickDelayMs(budgetLeft, healthPaused, stormHeld))
             }
         } finally {
+            crawlSupervisor.cancel() // R419：在飞爬取一并回收（游标按页落盘，重建后续爬不丢进度）
             enumJob.cancel()
             IndexCrawlService.stop(app) // 幂等：未挂牌时为无操作
             indexSchedulerAlive = false // R191：调度器终止（此后点按走直接建库路径）

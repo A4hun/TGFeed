@@ -3,11 +3,21 @@ package dev.tgfeed.core.prefs
 import android.content.Context
 import dev.tgfeed.BuildConfig
 import dev.tgfeed.core.feed.DemandSubscription
+import dev.tgfeed.core.store.HarvestDiscoveredStore
 import dev.tgfeed.core.tastemap.TasteTour
+import java.io.File
 
 /** 轻量配置存储：API 凭证 + 代理设置 + 上次使用模式（应用内可改，无需重新编译） */
 class AppPrefs(context: Context) {
     private val sp = context.getSharedPreferences("tgfeed", Context.MODE_PRIVATE)
+
+    /**
+     * R432：收割发现清单独立文件的落盘目录（数据目录全 App 唯一，各处 new 的
+     * AppPrefs 实例取到同一路径；见 harvestDiscoveredJson）。不可得（纯 JVM 单测
+     * 的 mock Context 没挂 filesDir 等）时为 null——harvestDiscoveredJson 回落旧
+     * 主 SP 键路径，行为与迁移前完全一致
+     */
+    private val filesDir: File? = runCatching { context.filesDir }.getOrNull()
 
     init {
         // 金矿 P4-B：需求订阅匹配器挂载（幂等）。本类在 App.onCreate 即被 AppContainer
@@ -479,6 +489,16 @@ class AppPrefs(context: Context) {
         get() = sp.getBoolean("show_videos", true)
         set(v) = sp.edit().putBoolean("show_videos", v).apply()
 
+    /** R413 关键词屏蔽：是否同时匹配频道名（默认关——只匹配标题/caption/tag） */
+    var muteMatchChannelTitle: Boolean
+        get() = sp.getBoolean("mute_match_channel_title", false)
+        set(v) = sp.edit().putBoolean("mute_match_channel_title", v).apply()
+
+    /** R415 分屏格子按内容宽高比按行装箱（默认开；关 = 回退旧等分流式格位） */
+    var gridJustifiedRows: Boolean
+        get() = sp.getBoolean("grid_justified_rows", true)
+        set(v) = sp.edit().putBoolean("grid_justified_rows", v).apply()
+
     /** 内容类型开关：图片（默认开） */
     var showPhotos: Boolean
         get() = sp.getBoolean("show_photos", true)
@@ -580,6 +600,40 @@ class AppPrefs(context: Context) {
         get() = sp.getString("last_digest_date", "") ?: ""
         set(v) = sp.edit().putString("last_digest_date", v).apply()
 
+    // ---------------- R392 播放编排三期(#6① 晨间定时开台,FeedPlayChainPart 晨间循环) ----------------
+
+    /**
+     * 晨间定时开台总开关(默认 **false**):每日闸点自动生成今日单并开台播单。
+     * 判词(与 digest 默认开分立):digest=通知弱动作,默认开可接受;晨间开台=
+     * 自动开播强意图动作,主动开通才对——默认关,设置口=播放台列表(QueueStations
+     * Screen 晨间定时行)。
+     * 调度=进程内协程闸点循环(DailyDigest 判词,VM viewModelScope——r392b_notes
+     * §1.4/§3.2):零新后台常驻、零新权限面;已知局限=app 不开/进程被杀则当日
+     * 不触发,下次启动补查兜底(迟到窗口内)。
+     */
+    var morningStationEnabled: Boolean
+        get() = sp.getBoolean("morning_station_enabled", false)
+        set(v) = sp.edit().putBoolean("morning_station_enabled", v).apply()
+
+    /**
+     * 晨间闸点(每日的分钟数 0..1439,默认 450=7:30):「每日 HH:mm」的存储形态
+     * (显示层拆 HH:mm;分钟粒度=电台晨间语义够用)。改设置即时重挂循环
+     * (setMorningStationAlarmImpl,sleepJob 重挂同款纪律)。
+     */
+    var morningStationMinuteOfDay: Int
+        get() = sp.getInt("morning_station_minute_of_day", 450)
+        set(v) = sp.edit().putInt("morning_station_minute_of_day", v.coerceIn(0, 1439)).apply()
+
+    /**
+     * 最近一次晨间开台真实开成的本地日期(yyyy-MM-dd,空=从未):幂等闸——
+     * 值等于今天=当日已开,重复触发只打判定日志;**只在今日台真正生成并开台后
+     * 落盘**(原料缺空态/超时未知不落,补报机会留给下次触发——digest「发出才落」
+     * 同纪律)。
+     */
+    var lastMorningStationDate: String
+        get() = sp.getString("last_morning_station_date", "") ?: ""
+        set(v) = sp.edit().putString("last_morning_station_date", v).apply()
+
     // ---------------- R203 那年今日推送（core/onthisday/OnThisDayPush） ----------------
 
     /**
@@ -636,6 +690,11 @@ class AppPrefs(context: Context) {
     var diagServerEnabled: Boolean
         get() = sp.getBoolean("diag_server_enabled", true)
         set(v) = sp.edit().putBoolean("diag_server_enabled", v).apply()
+
+    /** R420 后台定时同步间隔（分钟；0=关闭，可选 15/30/60，默认 30；非法值由 BackgroundSyncPolicy 归一） */
+    var backgroundSyncMinutes: Int
+        get() = sp.getInt("bg_sync_minutes", 30)
+        set(v) = sp.edit().putInt("bg_sync_minutes", v).apply()
 
     /**
      * 通知权限是否已问过（R52，默认 false）：Android 13+ 的 POST_NOTIFICATIONS
@@ -884,10 +943,20 @@ class AppPrefs(context: Context) {
      * 跨进程重启保留：冷启动首个收割周期直接用存量清单开工，
      * 避免每次重启都把"简介/ bot 身份"特征实证的请求开销重付一遍；
      * 每小时重扫后整体覆写。内容损坏时读取侧按空表重建（全 runCatching，不崩）。
+     *
+     * R432 启动性能：该字段是主 SP 文件里的最大 JSON（MB 级），单文件全量重写模型
+     * 下拖累其他所有小键的写放大 + 冷启动装载。已迁 filesDir/harvest_discovered.json
+     * 独立文件（[dev.tgfeed.core.store.HarvestDiscoveredStore]：懒加载 + tmp+rename
+     * 原子写 + 首次访问自动从旧 SP 键迁移），读写口仍收在本属性内，调用方无感。
      */
     var harvestDiscoveredJson: String
-        get() = sp.getString("harvest_discovered_json", "") ?: ""
-        set(v) = sp.edit().putString("harvest_discovered_json", v).apply()
+        get() = filesDir?.let { HarvestDiscoveredStore.read(it, sp) }
+            ?: sp.getString(HarvestDiscoveredStore.LEGACY_SP_KEY, "") ?: "" // 兜底：无 filesDir（纯 JVM 单测）走旧主 SP 键
+        set(v) {
+            val dir = filesDir
+            if (dir != null) HarvestDiscoveredStore.write(dir, sp, v)
+            else sp.edit().putString(HarvestDiscoveredStore.LEGACY_SP_KEY, v).apply()
+        }
 
     /**
      * 自动发现清单的最近重扫时刻（毫秒时间戳，GroupHarvester 随 harvestDiscoveredJson 一起写）。

@@ -76,6 +76,9 @@ internal fun FeedViewModel.reloadSyncedStateFromStore(changed: Set<MultiSync.Dom
             MultiSync.Domain.DIS -> {
                 _dislikedKeys.value = runCatching { store.loadDisliked() }.getOrNull() ?: continue
             }
+            MultiSync.Domain.KW -> {
+                _mutedKeywords.value = runCatching { store.loadMutedKeywords() }.getOrNull() ?: continue
+            }
             MultiSync.Domain.BITEM -> {
                 _blockedItems.value = runCatching { store.loadBlockedItems() }.getOrNull() ?: continue
             }

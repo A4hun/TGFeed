@@ -87,4 +87,18 @@ class BoundedLruCacheTest {
         assertEquals(0, cache.size())
         assertNull(cache[1])
     }
+
+    @Test
+    fun `remove 逐条移除_返回旧值_未命中返回 null`() {
+        // R428 searchBotCache 收编锚点：TTL 过期条目由调用方命中时顺手清理
+        val cache = BoundedLruCache<String, Pair<Long, List<Int>>>(maxEntries = 4)
+        val page = listOf(1, 2, 3)
+        cache["bot:kw"] = 100L to page
+        cache["bot:kw2"] = 200L to emptyList()
+        assertEquals(100L to page, cache.remove("bot:kw")) // 移除并返回旧值（TTL 过期路径）
+        assertNull(cache.remove("bot:kw")) // 再移除：未命中返回 null
+        assertNull(cache["bot:kw"])
+        assertEquals(1, cache.size()) // 只清了目标条，邻居不动
+        assertEquals(200L to emptyList<Int>(), cache.remove("bot:kw2"))
+    }
 }

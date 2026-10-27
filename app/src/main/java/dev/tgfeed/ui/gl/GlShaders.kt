@@ -179,6 +179,28 @@ float fbm3(vec3 p) {
 float fbm2(vec3 p) {
     return (vnoise3(p) * 0.5 + vnoise3(p * 2.0 + 7.3) * 0.25) / 0.75;
 }
+// R412d 贴脸米粒 Voronoi（3D 细胞：x=F1 y=F2 z=胞随机值；hash3 复用，27 邻胞单 hash
+// 派生抖动向量——仅贴脸分支调用，远景零成本）
+vec3 voro3(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    float f1 = 8.0;
+    float f2 = 8.0;
+    float id = 0.0;
+    for (int z = -1; z <= 1; z++) {
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                vec3 o = vec3(float(x), float(y), float(z));
+                float h = hash3(i + o);
+                vec3 r = o + fract(h * vec3(1.0, 17.13, 131.7)) * 0.8 + 0.1 - f;
+                float dd = dot(r, r);
+                if (dd < f1) { f2 = f1; f1 = dd; id = h; }
+                else if (dd < f2) { f2 = dd; }
+            }
+        }
+    }
+    return vec3(sqrt(f1), sqrt(f2), id);
+}
 vec4 shadeSphere(
     vec3 n, vec3 worldPos, vec3 camPos,
     vec3 core, vec3 star, vec3 edge,
@@ -213,6 +235,22 @@ vec4 shadeSphere(
     // churn=米粒组织沸腾演化）+胞界暗脉（中位等值线=胞界网络）
     vec3 cellP = np * 7.0 + seed + vec3(time * 0.021, 0.0, -time * 0.013);
     float g = fbm3(cellP);
+    // R409b 贴脸细节八度（屏径自适应——fwidth 估法线空间像素跨度 pxN：
+    // 第 k 八度频率 7×2^k，周期屏像素≈1/(f·pxN)；周期 ≥4px 起淡入、≥8px 满幅；
+    // 远/中档 pxN 大→权重 0→分支跳过=逐位旧输出；fBm 振幅律续接（零均值叠加））
+    float pxN = length(fwidth(np));
+    float wd1 = 1.0 - smoothstep(0.125, 0.25, 56.0 * pxN);
+    if (wd1 > 0.001) {
+        g += (vnoise3(cellP * 8.0 + 21.7) - 0.5) * 0.075 * wd1;
+        float wd2 = 1.0 - smoothstep(0.125, 0.25, 112.0 * pxN);
+        if (wd2 > 0.001) {
+            g += (vnoise3(cellP * 16.0 + 37.9) - 0.5) * 0.045 * wd2;
+            float wd3 = 1.0 - smoothstep(0.125, 0.25, 224.0 * pxN);
+            if (wd3 > 0.001) {
+                g += (vnoise3(cellP * 32.0 + 53.3) - 0.5) * 0.03 * wd3;
+            }
+        }
+    }
     float gc = clamp((g - 0.5) * 1.6, -0.5, 0.5) + 0.5;
     val *= 1.0 + grainAmp * (gc - 0.5) * 2.0;
     float lane = 1.0 - abs(2.0 * g - 1.0);
@@ -222,6 +260,47 @@ vec4 shadeSphere(
     float sn2 = fbm2(np * 2.3 + seed * 1.71);
     float spot = smoothstep(0.62, 0.74, sn2) * spotAmp;
     val *= mix(1.0 - 0.28 * spot, 1.0 + 0.18 * spot, hot);
+    // R412d 贴脸表面丰富化（仅 wd1>0=近距离分支；wd1=0 时整段跳过=远景逐位旧输出）：
+    // ① Voronoi 米粒（亮心暗边胞）② 超米粒网格调制 ③ 黑子本影/半影放射纹
+    // ④ 临边光斑网纹（limb 附近亮网）⑤ 临边毛刺增强
+    if (wd1 > 0.001) {
+        vec3 gp = np * 40.0 + seed * 3.1 + vec3(0.0, 0.0, time * 0.035);
+        vec3 vo = voro3(gp);
+        float edgeW = vo.y - vo.x;
+        float cellC = smoothstep(0.0, 0.32, edgeW);
+        // ② 超米粒（≈米粒 6 倍尺度低频——调米粒对比与微亮度）
+        float sg = vnoise3(np * 6.5 + seed * 1.37 + vec3(time * 0.004, 0.0, 0.0));
+        // 黑子区内米粒被压制（磁场抑制对流）
+        float gAmp = (0.16 + 0.10 * sg) * wd1 * (1.0 - 0.8 * spot);
+        val *= 1.0 + gAmp * ((cellC - 0.55) * 1.4 + (vo.z - 0.5) * 0.35);
+        val *= 1.0 + 0.06 * wd1 * (sg - 0.5);
+        // ③ 黑子本影/半影放射纹（梯度向量求放射方向；仅斑区内）
+        if (spot > 0.02) {
+            vec3 sp = np * 2.3 + seed * 1.71;
+            float e = 0.02;
+            vec3 gr = vec3(fbm2(sp + vec3(e, 0.0, 0.0)), fbm2(sp + vec3(0.0, e, 0.0)),
+                fbm2(sp + vec3(0.0, 0.0, e))) - sn2;
+            gr -= n * dot(gr, n);
+            vec3 rd = normalize(gr + vec3(1e-5));
+            vec3 td = cross(n, rd);
+            float umb = smoothstep(0.70, 0.78, sn2) * spotAmp;
+            float pen = clamp(spot - umb, 0.0, 1.0);
+            float fil = vnoise3(vec3(dot(np, td) * 70.0, dot(np, rd) * 8.0, seed * 5.0));
+            float cold = 1.0 - hot;
+            val *= 1.0 - wd1 * cold * (0.45 * umb + pen * 0.30 * (fil - 0.35));
+            val *= 1.0 + wd1 * hot * pen * 0.20 * fil;
+        }
+        // ④ 临边光斑网纹（米粒胞界亮网×超米粒掩模，越近临边越显）
+        float fac = (1.0 - smoothstep(0.0, 0.10, edgeW)) * smoothstep(0.55, 0.93, d)
+            * smoothstep(0.35, 0.75, sg);
+        val *= 1.0 + wd1 * 0.45 * fac;
+        // ⑤ 临边毛刺增强（缘带高频角向焰丝）
+        float bandC = smoothstep(0.84, 0.92, d) * (1.0 - smoothstep(0.975, 1.0, d));
+        if (bandC > 0.001) {
+            float sp2 = vnoise3(np * 60.0 + vec3(0.0, time * 0.6, seed * 1.9));
+            val *= 1.0 + wd1 * bandC * (0.25 + 0.6 * flameAmp) * (sp2 - 0.45);
+        }
+    }
     // 色球火苗（缘带角向高频 fBm 随时间缓漂——焰舌起伏；活动烈度定幅）
     float band = smoothstep(0.80, 0.90, d) * (1.0 - smoothstep(0.97, 1.0, d));
     if (band > 0.001 && flameAmp > 0.001) {
@@ -1015,7 +1094,11 @@ out vec4 fragColor;
 // 载体内等价身份映射——场统计基因不变）
 float fieldAt(highp vec3 p) {
     highp vec3 so = fract(vec3(uSeed * 0.1031, uSeed * 0.173, uSeed * 0.3113));
-    return texture(uNoiseVol, p * 0.0625 + so).r;
+    // R404 textureLod 显式 LOD0:隐式导数在 RAYMARCH_FS 发散循环(逐像素 t1/t0
+    // 不同 + break 分支)的 lane 上=ES3 未定义行为→mip 链塌到 1³ 全局均值→密度
+    // 门饱和=无结构白体(用户白色圆饼实锚——两域 fieldAt 同体共用,显式 LOD0=
+    // 64³ 原始纹理零依赖导数,唯一正解,语义单源不变)
+    return textureLod(uNoiseVol, p * 0.0625 + so, 0.0).r;
 }
 void main() {
     float d = length(vLocal);
@@ -1108,10 +1191,18 @@ uniform float uBloomGain;
 uniform vec4 uFlarePos[3];
 uniform vec3 uFlareColor[3];
 uniform float uAspect;
+uniform float uBodyBloomCut; // R412d 贴脸恒星本体 bloom 适度削减比（0=旧行为）
 in vec2 vUV;
 out vec4 fragColor;
 void main() {
-    vec3 col = texture(uScene, vUV).rgb + texture(uBloom, vUV).rgb * uBloomGain;
+    vec3 sc = texture(uScene, vUV).rgb;
+    vec3 bl = texture(uBloom, vUV).rgb;
+    // R412d：大面积亮盘（贴脸恒星本体：模糊后 bloom≈原亮度）处削减泛光，保表面细节；
+    // 远景小亮星核 bloom≪原亮度→比值门关闭=原样（光晕外圈不受影响）
+    float lS = dot(sc, vec3(0.2126, 0.7152, 0.0722));
+    float lB = dot(bl, vec3(0.2126, 0.7152, 0.0722));
+    float body = smoothstep(0.55, 0.90, lB / max(lS, 0.001)) * smoothstep(0.45, 0.80, lS);
+    vec3 col = sc + bl * uBloomGain * (1.0 - uBodyBloomCut * body);
     vec2 ndc = vec2(vUV.x * 2.0 - 1.0, 1.0 - vUV.y * 2.0);
     ndc.x *= uAspect;
     for (int i = 0; i < 3; i++) {
@@ -1188,7 +1279,11 @@ uniform mediump sampler3D uNoiseVol;
 // 载体内等价身份映射——场统计基因不变）
 float fieldAt(highp vec3 p) {
     highp vec3 so = fract(vec3(uSeed * 0.1031, uSeed * 0.173, uSeed * 0.3113));
-    return texture(uNoiseVol, p * 0.0625 + so).r;
+    // R404 textureLod 显式 LOD0:隐式导数在 RAYMARCH_FS 发散循环(逐像素 t1/t0
+    // 不同 + break 分支)的 lane 上=ES3 未定义行为→mip 链塌到 1³ 全局均值→密度
+    // 门饱和=无结构白体(用户白色圆饼实锚——两域 fieldAt 同体共用,显式 LOD0=
+    // 64³ 原始纹理零依赖导数,唯一正解,语义单源不变)
+    return textureLod(uNoiseVol, p * 0.0625 + so, 0.0).r;
 }
 // R383 ign 蓝噪 hash 抖动（interleave gradient noise——静态无时间项=R343 零闪烁）
 float ign(vec2 p) {

@@ -81,6 +81,11 @@ internal class TasteGlRenderer(
     private var vboUnitQuad = 0
     private var iboSphere = 0
     private var sphereIndexCount = 0
+    // R409b 高模贴脸档（96×64——屏半径 >GlSphereMesh.HI_MIN_RADIUS_PX 的全模真球/
+    // 行星换此网格；独立 glGenBuffers(2)——R349 的 17 件清点不动）
+    private var vboSphereHi = 0
+    private var iboSphereHi = 0
+    private var hiSphereIndexCount = 0
     // R349 低模球三件（mesh/IBO/实例——VBO 句柄预算清点：onSurfaceCreated 生成
     // 17 个（原 14+新 3），映射位见下三行；EGL 丢失重建随上下文全量重生成）
     private var vboSphereLod = 0
@@ -462,6 +467,23 @@ internal class TasteGlRenderer(
             GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, iboSphere)
             GLES30.glBufferData(GLES30.GL_ELEMENT_ARRAY_BUFFER, sphereIdx.size * 2, ib, GLES30.GL_STATIC_DRAW)
 
+            // R409b 高模贴脸球网格（静态——96×64；同一生成式换参数 [GlSphereMesh.HI_*]）
+            val hiIds = IntArray(2)
+            GLES30.glGenBuffers(2, hiIds, 0)
+            vboSphereHi = hiIds[0]
+            iboSphereHi = hiIds[1]
+            val hiVerts = GlSphereMesh.buildVertices(GlSphereMesh.HI_SLICES, GlSphereMesh.HI_STACKS)
+            val hiIdx = GlSphereMesh.buildIndices(GlSphereMesh.HI_SLICES, GlSphereMesh.HI_STACKS)
+            hiSphereIndexCount = hiIdx.size
+            val hvb = ByteBuffer.allocateDirect(hiVerts.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+            hvb.put(hiVerts).flip()
+            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vboSphereHi)
+            GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, hiVerts.size * 4, hvb, GLES30.GL_STATIC_DRAW)
+            val hib = ByteBuffer.allocateDirect(hiIdx.size * 2).order(ByteOrder.nativeOrder()).asShortBuffer()
+            hib.put(hiIdx).flip()
+            GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, iboSphereHi)
+            GLES30.glBufferData(GLES30.GL_ELEMENT_ARRAY_BUFFER, hiIdx.size * 2, hib, GLES30.GL_STATIC_DRAW)
+
             // R349 低模球网格（静态——8×6=96 三角；同一生成式换参数 [GlSphereMesh.LOD_*]）
             val lodVerts = GlSphereMesh.buildVertices(GlSphereMesh.LOD_SLICES, GlSphereMesh.LOD_STACKS)
             val lodIdx = GlSphereMesh.buildIndices(GlSphereMesh.LOD_SLICES, GlSphereMesh.LOD_STACKS)
@@ -768,11 +790,7 @@ internal class TasteGlRenderer(
                     GLES30.glUniform3f(uTideAxisSphere, sb[i + 22], sb[i + 23], sb[i + 24])
                     GLES30.glUniform2f(uTideGrowSphere, sb[i + 25], sb[i + 26])
                     GLES30.glUniform3f(uCamPosSphere, f.cam.px, f.cam.py, f.cam.pz)
-                    GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vboSphere)
-                    GLES30.glEnableVertexAttribArray(0)
-                    GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 12, 0)
-                    GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, iboSphere)
-                    GLES30.glDrawElements(GLES30.GL_TRIANGLES, sphereIndexCount, GLES30.GL_UNSIGNED_SHORT, 0)
+                    drawFullSphereMesh(sb[i], sb[i + 1], sb[i + 2], sb[i + 3], f.cam.px, f.cam.py, f.cam.pz, focalPx)
                 }
                 GlFrameBuilder.OP_SPHERE_I -> {
                     // R349 低模球 instanced 批（OP_ROCK 先例同款——divisor=1+
@@ -786,7 +804,7 @@ internal class TasteGlRenderer(
                     GLES30.glEnableVertexAttribArray(0)
                     GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 12, 0)
                     GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vboSphereInst)
-                    bindSphereInstAttribs()
+                    bindSphereInstAttribs(builder.opA[k])
                     GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, iboSphereLod)
                     GLES30.glDrawElementsInstanced(
                         GLES30.GL_TRIANGLES, lodSphereIndexCount, GLES30.GL_UNSIGNED_SHORT, 0,
@@ -871,11 +889,7 @@ internal class TasteGlRenderer(
                     GLES30.glUniform1f(uGasPlanet, pb[i + 12])
                     GLES30.glUniform1f(uAlphaPlanet, pb[i + 13])
                     GLES30.glUniform3f(uCamPosPlanet, f.cam.px, f.cam.py, f.cam.pz)
-                    GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vboSphere)
-                    GLES30.glEnableVertexAttribArray(0)
-                    GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 12, 0)
-                    GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, iboSphere)
-                    GLES30.glDrawElements(GLES30.GL_TRIANGLES, sphereIndexCount, GLES30.GL_UNSIGNED_SHORT, 0)
+                    drawFullSphereMesh(pb[i], pb[i + 1], pb[i + 2], pb[i + 3], f.cam.px, f.cam.py, f.cam.pz, focalPx)
                 }
                 GlFrameBuilder.OP_RING -> {
                     setDepthMode(2) // 环带=测不写（与母球真穿插；环间互序=画家序）
@@ -918,7 +932,7 @@ internal class TasteGlRenderer(
                     GLES30.glEnableVertexAttribArray(1)
                     GLES30.glVertexAttribPointer(1, 3, GLES30.GL_FLOAT, false, 24, 12)
                     GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vboRockInst)
-                    bindRockInstAttribs()
+                    bindRockInstAttribs(builder.opA[k])
                     GLES30.glDrawArraysInstanced(
                         GLES30.GL_TRIANGLES, 0, GlRockMesh.SOUP_VERTS,
                         builder.opB[k],
@@ -1058,13 +1072,14 @@ internal class TasteGlRenderer(
             volWindowHadVolume = false
             Log.i(
                 "TasteMapX",
-                "R281 GL帧率: %.1ffps 慢帧=%.1f%% 末帧(点=${builder.pointCount} 线=${builder.lineVertCount} 四边形=${builder.quadCount} 球=${builder.statSphereStars} 冕=${builder.statCoronas} 行星=${builder.statPlanets} 微点行星=${builder.statPlanetDots} 环=${builder.ringCount} 岩石=${builder.statRocks} 可见星=${builder.statVisibleStars} 微星=${builder.statMicroStars} op=${builder.opCount} 装配=%.2fms(景%.2f/星%.2f/效%.2f) 上传=%.2fms 回放=%.2fms 后处理=%.2fms)".format(
+                "R281 GL帧率: %.1ffps 慢帧=%.1f%% 末帧(点=${builder.pointCount} 线=${builder.lineVertCount} 四边形=${builder.quadCount} 球=${builder.statSphereStars} 冕=${builder.statCoronas} 行星=${builder.statPlanets} 微点行星=${builder.statPlanetDots} 环=${builder.ringCount} 岩石=${builder.statRocks} 可见星=${builder.statVisibleStars} 微星=${builder.statMicroStars} op=${builder.opCount} 装配=%.2fms(景%.2f/星%.2f/效%.2f) 上传=%.2fms 回放=%.2fms 后处理=%.2fms) 高模球=${hiSphereDraws}".format(
                     fpsFrames / sec, fpsSlow * 100f / fpsFrames,
                     (t1 - t0) / 1_000_000f, builder.statSceneMs, builder.statStarsMs, builder.statFxMs,
                     (t2 - t1) / 1_000_000f, (t3 - t2) / 1_000_000f, (t4 - t3) / 1_000_000f,
                 ),
             )
             fpsWindowStartNs = nowNs
+            hiSphereDraws = 0
             fpsFrames = 0
             fpsSlow = 0
         }
@@ -1166,6 +1181,37 @@ internal class TasteGlRenderer(
         volCall.resDiv = GlVolumePolicy.resDivisorOf(volumeTier)
         return true
     }
+
+    // ==================== R409b 全模球网格按屏径选档 ====================
+
+    /**
+     * 全模真球/行星的网格绑定+绘制（OP_SPHERE/OP_PLANET 共用）：屏半径≈focal×r/距离
+     * 超 [GlSphereMesh.HI_MIN_RADIUS_PX]（或相机贴入球内）→96×64 高模档，否则原
+     * 24×16 档（远中档逐位旧路径）。程序/uniform 不变——只换网格。
+     */
+    private fun drawFullSphereMesh(
+        cx: Float, cy: Float, cz: Float, r: Float,
+        camX: Float, camY: Float, camZ: Float, focalPx: Float,
+    ) {
+        val dx = cx - camX
+        val dy = cy - camY
+        val dz = cz - camZ
+        val dist = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
+        val hi = hiSphereIndexCount > 0 &&
+            (dist <= r || focalPx * r / dist > GlSphereMesh.HI_MIN_RADIUS_PX)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, if (hi) vboSphereHi else vboSphere)
+        GLES30.glEnableVertexAttribArray(0)
+        GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, 12, 0)
+        GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, if (hi) iboSphereHi else iboSphere)
+        GLES30.glDrawElements(
+            GLES30.GL_TRIANGLES, if (hi) hiSphereIndexCount else sphereIndexCount,
+            GLES30.GL_UNSIGNED_SHORT, 0,
+        )
+        if (hi) hiSphereDraws++
+    }
+
+    /** R409b 高模档绘制计数（帧率日志窗累计——贴脸实证用） */
+    private var hiSphereDraws = 0
 
     // ==================== 深度状态机 ====================
 
@@ -1283,17 +1329,19 @@ internal class TasteGlRenderer(
     }
 
     /** 岩石实例属性（posScale4/spinAxis4/color4/lightEmber4/seed1——divisor=1） */
-    private fun bindRockInstAttribs() {
+    private fun bindRockInstAttribs(firstInstance: Int) {
         val stride = GlFrameBuilder.ROCK_STRIDE * 4
+        // R407 同类修：批起始实例=指针基址（flushRocks 多批时旧件恒从 0 重画）
+        val base = firstInstance * stride
         for (loc in 2..6) {
             GLES30.glEnableVertexAttribArray(loc)
             GLES30.glVertexAttribDivisor(loc, 1)
         }
-        GLES30.glVertexAttribPointer(2, 4, GLES30.GL_FLOAT, false, stride, 0)
-        GLES30.glVertexAttribPointer(3, 4, GLES30.GL_FLOAT, false, stride, 16)
-        GLES30.glVertexAttribPointer(4, 4, GLES30.GL_FLOAT, false, stride, 32)
-        GLES30.glVertexAttribPointer(5, 4, GLES30.GL_FLOAT, false, stride, 48)
-        GLES30.glVertexAttribPointer(6, 1, GLES30.GL_FLOAT, false, stride, 64)
+        GLES30.glVertexAttribPointer(2, 4, GLES30.GL_FLOAT, false, stride, base)
+        GLES30.glVertexAttribPointer(3, 4, GLES30.GL_FLOAT, false, stride, base + 16)
+        GLES30.glVertexAttribPointer(4, 4, GLES30.GL_FLOAT, false, stride, base + 32)
+        GLES30.glVertexAttribPointer(5, 4, GLES30.GL_FLOAT, false, stride, base + 48)
+        GLES30.glVertexAttribPointer(6, 1, GLES30.GL_FLOAT, false, stride, base + 64)
     }
 
     /** 岩石实例除数复位（divisor 残留会污染后续非 instanced draw——驱动态卫生） */
@@ -1306,18 +1354,22 @@ internal class TasteGlRenderer(
 
     /** R349 低模球实例属性（位+径/芯+alpha/星+颗粒/缘+种子/自转+时间+黑子+火苗/
      *  热星+临边+ambient+预留——location 2..7 divisor=1，[GlFrameBuilder.SPHERE_I_STRIDE] 语义） */
-    private fun bindSphereInstAttribs() {
+    private fun bindSphereInstAttribs(firstInstance: Int) {
         val stride = GlFrameBuilder.SPHERE_I_STRIDE * 4
+        // R407 病灶二根治：批起始实例=属性指针字节基址（ES3 无 baseInstance——
+        // 旧件恒 0=每个 OP_SPHERE_I 批都从第 0 实例重画，后续批的星永不上屏；
+        // L1 全低模档恒星全部入批+画家序交错多批=「画面一动恒星整层消失」）
+        val base = firstInstance * stride
         for (loc in 2..7) {
             GLES30.glEnableVertexAttribArray(loc)
             GLES30.glVertexAttribDivisor(loc, 1)
         }
-        GLES30.glVertexAttribPointer(2, 4, GLES30.GL_FLOAT, false, stride, 0)
-        GLES30.glVertexAttribPointer(3, 4, GLES30.GL_FLOAT, false, stride, 16)
-        GLES30.glVertexAttribPointer(4, 4, GLES30.GL_FLOAT, false, stride, 32)
-        GLES30.glVertexAttribPointer(5, 4, GLES30.GL_FLOAT, false, stride, 48)
-        GLES30.glVertexAttribPointer(6, 4, GLES30.GL_FLOAT, false, stride, 64)
-        GLES30.glVertexAttribPointer(7, 4, GLES30.GL_FLOAT, false, stride, 80)
+        GLES30.glVertexAttribPointer(2, 4, GLES30.GL_FLOAT, false, stride, base)
+        GLES30.glVertexAttribPointer(3, 4, GLES30.GL_FLOAT, false, stride, base + 16)
+        GLES30.glVertexAttribPointer(4, 4, GLES30.GL_FLOAT, false, stride, base + 32)
+        GLES30.glVertexAttribPointer(5, 4, GLES30.GL_FLOAT, false, stride, base + 48)
+        GLES30.glVertexAttribPointer(6, 4, GLES30.GL_FLOAT, false, stride, base + 64)
+        GLES30.glVertexAttribPointer(7, 4, GLES30.GL_FLOAT, false, stride, base + 80)
     }
 
     /** R349 低模球实例除数复位（OP_ROCK 同款驱动态卫生——divisor 残留防污染） */

@@ -27,6 +27,7 @@ import dev.tgfeed.core.store.ChannelExposureLedger
 import dev.tgfeed.core.store.DownloadRecord
 import dev.tgfeed.core.store.LocalStore
 import dev.tgfeed.core.store.PlaylistMeta
+import dev.tgfeed.core.store.PlayStationsState
 import dev.tgfeed.core.store.Subscription
 import dev.tgfeed.core.store.WatchEvent
 import dev.tgfeed.core.td.ChannelBrief
@@ -230,8 +231,10 @@ class FeedViewModel(
             // 时按当时在场值放行（维度与修前一致，如实记——本刀主疗效=类型过滤，
             // 确定性来自 prefs 持久层与 tab 状态）。
             val typePrefsR390 = dev.tgfeed.core.prefs.AppPrefs(app)
+            // R413：关键词屏蔽同口径（词表由 init 预载协程供给，未到位时按空表放行——同屏蔽集合）
+            val kwR413 = keywordMatcher()
             val snapFresh = snap.items.filter {
-                it.key !in snapSeenK && (it.fileUniqueId.isEmpty() || it.fileUniqueId !in snapSeenU) &&
+                !kwR413.hits(it) && it.key !in snapSeenK && (it.fileUniqueId.isEmpty() || it.fileUniqueId !in snapSeenU) &&
                     SnapshotReplayPolicy.typeAligned(
                         it,
                         _mediaTypeTab.value,
@@ -428,6 +431,16 @@ class FeedViewModel(
     internal val _dislikedKeys = MutableStateFlow<Set<String>>(emptySet())
     val dislikedKeys: StateFlow<Set<String>> = _dislikedKeys.asStateFlow()
 
+    /** R413 用户屏蔽词集合（LocalStore muted_keywords.json 持久化，插入序） */
+    internal val _mutedKeywords = MutableStateFlow<Set<String>>(emptySet())
+    val mutedKeywords: StateFlow<Set<String>> = _mutedKeywords.asStateFlow()
+
+    /** R413 关键词屏蔽是否同时匹配频道名（AppPrefs 持久化，默认关） */
+    internal val _muteMatchChannelTitle = MutableStateFlow(false)
+    val muteMatchChannelTitle: StateFlow<Boolean> = _muteMatchChannelTitle.asStateFlow()
+
+    /** R413 预编译匹配器缓存（词表/开关变更时重建；读侧 [keywordMatcher]） */
+    @Volatile internal var keywordMatcherCache: Pair<Pair<Set<String>, Boolean>, KeywordMutePolicy.Matcher>? = null
     /**
      * 永久屏蔽表（blocked_items.json：连续 ≥[PERMANENT_BLOCK_THRESHOLD] 次"不感兴趣"的
      * 内容指纹黑名单）。与 disliked（单次、按 item.key 挡单条消息）并存：
@@ -476,6 +489,12 @@ class FeedViewModel(
     fun setExcludeWatched(v: Boolean) = setExcludeWatchedImpl(v)
     fun unblockChannel(chatId: Long) = unblockChannelImpl(chatId)
 
+    // ---- R413 关键词屏蔽公共 API（实现见 FeedKeywordMutePart.kt） ----
+    /** 添加屏蔽词；返回 null=成功（附本次剔除条数经 onRemoved 回调），非 null=拒绝原因 */
+    fun addMutedKeyword(raw: String, onRemoved: (Int) -> Unit = {}): String? = addMutedKeywordImpl(raw, onRemoved)
+    fun removeMutedKeyword(word: String) = removeMutedKeywordImpl(word)
+    fun clearMutedKeywords() = clearMutedKeywordsImpl()
+    fun setMuteMatchChannelTitle(v: Boolean) = setMuteMatchChannelTitleImpl(v)
     // ---- 点赞收藏公共 API 委托（实现见 FeedActionsPart.kt） ----
     fun toggleLike(item: VideoItem) = toggleLikeImpl(item)
     fun toggleFavorite(item: VideoItem) = toggleFavoriteImpl(item)
@@ -617,6 +636,9 @@ class FeedViewModel(
             while (isActive) {
                 delay(WATCH_HEARTBEAT_MS)
                 watchHeartbeatTick()
+                // R392 #5 段尽接棒挂点(视频路):供给尽∧末位视频真播完(主位播放器
+                // STATE_ENDED+归属判式)→段尽消费单口;非队列源/未尽/非末位时零开销直通
+                maybeAdvancePlayChainOnTick()
             }
         }
     }
@@ -730,6 +752,9 @@ class FeedViewModel(
      */
     @Volatile
     internal var indexSchedulerAlive = false
+
+    /** R419 深索引管线运行态（手动车道 + 纯计数；跨管线重建存活） */
+    internal val indexPipeline = IndexPipelineState()
 
     init {
         // R191 启动载入：钉住集合 prefs → 镜像 + 行台账（全部 building=false——
@@ -1066,6 +1091,8 @@ class FeedViewModel(
                 _watchLater.value = later.mapTo(LinkedHashSet<String>()) { it.key }
                 _blockedChannels.value = runCatching { store.loadBlockedChannels() }.getOrDefault(emptySet())
                 _dislikedKeys.value = runCatching { store.loadDisliked() }.getOrDefault(emptySet())
+                _mutedKeywords.value = runCatching { store.loadMutedKeywords() }.getOrDefault(emptySet())
+                _muteMatchChannelTitle.value = runCatching { prefs.muteMatchChannelTitle }.getOrDefault(false)
                 _blockedItems.value = runCatching { store.loadBlockedItems() }.getOrDefault(emptyList())
                 _autoAdvance.value = runCatching { prefs.autoAdvance }.getOrDefault(true)
                 // CRITICAL-2：收藏/稍后恢复完成后，同一协程串行体检复活（换发本会话新 fileId）——
@@ -1414,6 +1441,10 @@ class FeedViewModel(
                 runCatching { store.saveLastViewedKey(item.key, RESUME_SESSION_ID) }
             }
         }
+        // R387 队列级断点续播：在播源是播放队列时，落定条目→（来源段 entryId,key）
+        // 记账（队列专用通道，不打扰 watch/history 既有账；同条不重写——
+        // FeedPlayQueuePart.notePlayQueueResume）
+        if (item != null && source is PlayQueueFeedSource) notePlayQueueResume(item)
         // 预取提前（修"刷到头干等"）：旧阈值剩 4 条才拉——一轮聚合拉取秒级到十几秒
         //（40 频道窗口并发 SearchChatMessages + caption 展开），快刷 4 条只要几秒，
         // 剩余太少必到底干等；提到 8 条，配合 loadMore 的队列保底链式续拉不再刷到头
@@ -1804,8 +1835,12 @@ class FeedViewModel(
                     // 正页条目与历史回溯注入条目走完全相同的过滤链——老内容也要守规矩。
                     // R337：永久指纹段与已看段的"key+fileUniqueId 双轨"判定收口
                     // SeenDedupPolicy.isSeen（同一把尺三链共用，不再各写一份）
+                    // R413 关键词屏蔽：经 keywordMuteActive 豁免用户显式圈定的源（单频道/
+                    // 收藏/稍后/历史/播放队列——主动进去看的内容不替用户藏）；其余源与
+                    // 回溯/召回/新面孔注入共用本 pass，一处接入全链生效
+                    val kwMatcher = if (keywordMuteActive(src)) keywordMatcher() else KeywordMutePolicy.EMPTY
                     val pass: (VideoItem) -> Boolean = {
-                        it.chatId !in blocked && it.key !in disliked &&
+                        it.chatId !in blocked && it.key !in disliked && !kwMatcher.hits(it) &&
                             !SeenDedupPolicy.isSeen(it, permBlockedKeys, permBlockedUids) &&
                             !SeenDedupPolicy.isSeen(it, seenKeys, seenUids) &&
                             f.matches(it) &&
@@ -1827,6 +1862,9 @@ class FeedViewModel(
                     // 为空集，本行恒 0（口径随开关如实呈现）。
                     // R337：判定同收口 SeenDedupPolicy.isSeen
                     val seenHitCount = page.items.count { SeenDedupPolicy.isSeen(it, seenKeys, seenUids) }
+                    if (!kwMatcher.isEmpty && page.items.isNotEmpty()) {
+                        logKeywordMuteProbe("主Feed", kwMatcher, page.items.count { kwMatcher.hits(it) })
+                    }
                     if (page.items.isNotEmpty()) {
                         android.util.Log.i(
                             "FeedViewModel",
@@ -1933,10 +1971,15 @@ class FeedViewModel(
                     // P1.5 行为信号页内后处理（纯追加，不动上游六段链与过滤结论）：
                     // #4 会话序列动量（同主题条目有界前移 ≤2 位）→ #5 疲劳探索补位
                     //（会话观看 >45 分钟后探索 ≈10%→20%）；均无信号时原样直通
-                    val rankedP15 = applyP15PostRank(ranked, pageWeights)
+                    // R387 队列序保全：播放队列源跳过 P1.5/P2 页内后处理（有界前移
+                    // 会打乱显式节目单的段序/轮序——这两环对一切源生效无源判别，
+                    // 队列=显式清单语境须点名豁免；P1.5/P2 的重排价值在兴趣流，
+                    // 节目单用户要的是「我排的顺序」字面兑现）
+                    val queueSrc = src is PlayQueueFeedSource
+                    val rankedP15 = if (queueSrc) ranked else applyP15PostRank(ranked, pageWeights)
                     // P2 序列三件套页内消费（DIN 目标注意力 + 马尔可夫转移加分，有界前移
                     // ≤[P2_PROMOTE_MAX] 位；画像为空/无马尔可夫上下文时原样直通）
-                    val rankedP2 = applyP2SequenceRank(rankedP15)
+                    val rankedP2 = if (queueSrc) rankedP15 else applyP2SequenceRank(rankedP15)
                     // R98 每页新面孔保底（分页层硬保证：本页没有就不算完）——不足配额从
                     // 新面孔名册经深度索引抽样补位（供给接 R92 内容分层"有货"口径，
                     // 空频道不进名册），观测日志每页一行"本页新面孔：N 个（频道尾号…）"
@@ -1978,7 +2021,11 @@ class FeedViewModel(
                     // 身份集在 CAS 内从当前列表现算（P1-11：与主线程的 filterNot 剔除并发
                     // 时互不丢更新），且切源/刷新清空列表后折叠口径自动归零，无需额外会话状态。
                     val foldable = src !is FavoritesFeedSource &&
-                        src !is WatchLaterFeedSource && src !is HistoryFeedSource
+                        src !is WatchLaterFeedSource && src !is HistoryFeedSource &&
+                        // R387 播放队列=显式清单语境（条目用户显式排入）：折叠会让
+                        //「清单条数与记录数对不上」——三本地清单源同原则（前任遗言
+                        // 「重发折叠需 1 行豁免」的落点）；重发条目在队列里按段各就各位
+                        src !is PlayQueueFeedSource
                     var foldDropped = 0
                     var foldSurvived = 0
                     // R189 追加前代次复检（前任移交 H②，预存 TOCTOU——轨道切换高频化放大
@@ -2339,6 +2386,131 @@ class FeedViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             playlistMetas = runCatching { store.loadPlaylists() }.getOrDefault(emptyList())
             _playlists.value = playlistMetas.map { it.toPlaylist() }
+        }
+    }
+
+    // ---- R387 播放队列（节目单）公共 API 委托（实现见 FeedPlayQueuePart.kt） ----
+    fun enqueueChannelToPlayQueue(chatId: Long, title: String): Boolean =
+        enqueueChannelToPlayQueueImpl(chatId, title)
+    fun enqueueItemToPlayQueue(item: VideoItem): Boolean = enqueueItemToPlayQueueImpl(item)
+    fun enqueueWatchLaterToPlayQueue() = enqueueWatchLaterToPlayQueueImpl()
+    fun removeFromPlayQueue(entryId: String) = removeFromPlayQueueImpl(entryId)
+    fun movePlayQueueEntry(from: Int, to: Int) = movePlayQueueEntryImpl(from, to)
+    fun movePlayQueueEntryToTop(entryId: String) = movePlayQueueEntryToTopImpl(entryId)
+    fun togglePlayQueueSkip(entryId: String) = togglePlayQueueSkipImpl(entryId)
+    fun setPlayQueueOrder(mode: PlayQueueOrder) = setPlayQueueOrderImpl(mode)
+    fun clearPlayQueue() = clearPlayQueueImpl()
+    fun openPlayQueue(fromStart: Boolean) = openPlayQueueImpl(fromStart)
+
+    // ---- R391 播放台（多队列）台级 CRUD/开台委托（实现见 FeedPlayQueuePart.kt） ----
+    fun createPlayStation(name: String): Boolean = createPlayStationImpl(name)
+    fun renamePlayStation(id: String, name: String): Boolean = renamePlayStationImpl(id, name)
+    fun deletePlayStation(id: String): Boolean = deletePlayStationImpl(id)
+    fun editPlayStation(id: String): Boolean = editPlayStationImpl(id)
+    fun openPlayStation(id: String, fromStart: Boolean = false) = openPlayStationImpl(id, fromStart)
+
+    // ---- R391 #7 今日单生成委托（实现见 FeedPlayQueuePart.kt） ----
+    fun generateTodayStation() = generateTodayStationImpl()
+
+    // ---- R392 播放编排三期(#5 接棒/#6 定时)委托(实现见 FeedPlayChainPart/FeedPlayQueuePart) ----
+    fun setPlayStationChain(stationId: String, chainTo: String?) =
+        setPlayStationChainImpl(stationId, chainTo)
+
+    /** 晨间定时设置口(保存钮:开关+HH:mm→落盘+重挂循环) */
+    fun setMorningStationAlarm(enabled: Boolean, minuteOfDay: Int) =
+        setMorningStationAlarmImpl(enabled, minuteOfDay)
+
+    // ---- R398 播放编排四期(#9 离线联动·整单下载)委托(实现见 FeedStationDownloadPart.kt) ----
+    /** 台级「下载整单」：台内点名单条逐条走既有单条下载链（断续幂等）；返回实发条数 */
+    fun downloadPlayStation(stationId: String): Int = downloadPlayStationImpl(stationId)
+
+    // ---- R398 播放编排四期(#10 队列语义跳转)委托(实现见 FeedQueueJumpPart.kt) ----
+    /** 「跳到讲…」语义跳转：本地 caption 匹配+跳播开单（零网络）；false=无果 */
+    fun jumpToQueueSemantic(query: String): Boolean = jumpToQueueSemanticImpl(query)
+
+    /**
+     * 段尽单发门(R392 #5):已结算的队列源实例身份(=== 判同)——同源只消费
+     * 一次,睡眠停/自然停/静默待命/接棒均算已结算;接棒后新源实例=天然重置
+     * (链可续传 A→B→C)。见 FeedPlayChainPart.advancePlayChainAtQueueEnd。
+     */
+    internal var playChainSettledSource: FeedSource? = null
+
+    /**
+     * 晨间循环 Job(R392 #6①):进程内协程闸点循环(DailyDigest 判词,启动
+     * 补查+到点自查);设置变更重挂(setMorningStationAlarmImpl)。null 语义=
+     * 循环未起(仅构造瞬间)。
+     */
+    internal var morningAlarmJob: Job? = null
+
+    init {
+        // R392 #6① 晨间定时循环装机:错峰闸后启动补查+到点自查(零新后台常驻
+        // ——delay 协程不持锁不占线程;已知局限=进程死则当日不触发,下次启动
+        // 补查兜底(迟到窗口内),r392b_notes §3.2 判词)
+        startMorningAlarmLoop()
+    }
+
+    /**
+     * 今日台生成空态 nonce（每次原料缺+1；UI 层 LaunchedEffect 消费=Toast 引导
+     * ——core/feed 域零 Toast 判词，一次性事件走 nonce 单调递增防快照流去重吞）。
+     */
+    internal val _todayQueueEmptyHint = MutableStateFlow(0)
+    val todayQueueEmptyHint: StateFlow<Int> = _todayQueueEmptyHint.asStateFlow()
+
+    /**
+     * 队列纯模型（ListenQueueModel 模型纪律：非线程安全，全部变更走
+     * FeedPlayQueuePart 的 impl——UI 动作与 onPage 记账都在主线程）。
+     * R391 起模型=「活跃台」的编辑面（台级 CRUD 在 VM 编排域，r391_notes §2.3）。
+     */
+    internal val playQueueModel = PlayQueueModel()
+
+    /** 队列实况（QueueScreen 订阅：条目列表/档位/断点；每次变更后发布）＝活跃台实况 */
+    internal val _playQueue = MutableStateFlow(PlayQueue())
+    val playQueue: StateFlow<PlayQueue> = _playQueue.asStateFlow()
+
+    /** 播放台列表实况（QueueStationsScreen 订阅；发布序=updatedAt 降序=「最近动的在前」） */
+    internal val _playQueueStations = MutableStateFlow<List<PlayQueue>>(emptyList())
+    val playQueueStations: StateFlow<List<PlayQueue>> = _playQueueStations.asStateFlow()
+
+    /** 台列表底账（主线程内存；序=持久化序=追加序，与发布序分立） */
+    internal var playStations: List<PlayQueue> = emptyList()
+
+    /** 活跃台 id（null/失联=哨兵空模型；切换与删除的同步纪律见 FeedPlayQueuePart） */
+    internal var activePlayStationId: String? = null
+
+    /**
+     * 落盘串流（extraBufferCapacity=1 + DROP_OLDEST = conflate 语义：磁盘只关心
+     * 最新态，高频断点记账的中间态自然去重；单收集者串行写盘→写序不可能乱）。
+     * R391 起负载=全量台列表态（stations+activeId，v2 档整库落盘）。
+     */
+    internal val _playQueuePersist = MutableSharedFlow<PlayStationsState>(
+        extraBufferCapacity = 1,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+
+    init {
+        // 冷启动载入（play_queue.json v2→台列表恢复+活跃台装载→状态发布；空库也是
+        // 合法态（哨兵空模型），ListenQueueController 冷启动恢复同款；读盘在 IO，
+        // 模型恢复回主线程。v1 旧档在读侧自动迁移为迁移台（LocalStore 判词））
+        viewModelScope.launch(Dispatchers.IO) {
+            val restored = runCatching { store.loadPlayStations() }
+                .getOrDefault(PlayStationsState(emptyList(), null))
+            withContext(Dispatchers.Main) {
+                playStations = restored.stations
+                // 活跃台=activeId 档；失联回落第一台（诚实降级不硬指）
+                val active = restored.stations.firstOrNull { it.id == restored.activeId }
+                    ?: restored.stations.firstOrNull()
+                activePlayStationId = active?.id
+                playQueueModel.replaceAll(active ?: PlayQueue())
+                _playQueue.value = playQueueModel.queue
+                _playQueueStations.value = playStations.sortedByDescending { it.updatedAt }
+            }
+        }
+        // 落盘串流收集者：单协程串行写盘（写失败静默——下笔落盘覆盖同内容；
+        // VM 清场时最末笔在途丢失=断点略旧，可接受——一期挂账沿续）
+        viewModelScope.launch(Dispatchers.IO) {
+            _playQueuePersist.collect { state ->
+                runCatching { store.savePlayStations(state) }
+            }
         }
     }
 

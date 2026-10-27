@@ -30,6 +30,7 @@ android {
         targetSdk = 34
         versionCode = 2
         versionName = "0.2.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("int", "API_ID", apiId.toString())
         buildConfigField("String", "API_HASH", "\"$apiHash\"")
@@ -166,6 +167,8 @@ dependencies {
     }
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("androidx.profileinstaller:profileinstaller:1.3.1") // R421 启动预编译
+    implementation("androidx.work:work-runtime-ktx:2.9.1") // R420 后台定时同步
 
     // R292 视频封面 OCR 试点（T1a）：ML Kit Text Recognition v2 **bundled** 中文模型
     // （中文模型自带拉丁文识别，一举两得）。选型唯一出处 content-understanding-eval.md §2.1：
@@ -181,4 +184,13 @@ dependencies {
     testImplementation("io.mockk:mockk:1.13.13")
     // android.jar 自带的 org.json 是打桩版（所有方法抛异常）；引入真实现覆盖之
     testImplementation("org.json:json:20240303")
+
+    // ---- R422 instrumented UI 测试（src/androidTest），只在 MuMu 模拟器跑 ----
+    androidTestImplementation(composeBom)
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
 }

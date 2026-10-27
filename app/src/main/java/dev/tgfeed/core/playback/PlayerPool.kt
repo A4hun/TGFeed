@@ -178,8 +178,12 @@ class PlayerPool(
             if (navGate) return emptyList()
             navGate = true
             navIntercepted.clear()
-            val wasPlaying = busy.filterValues { it.playWhenReady }.keys.toList()
+            // R417：externals（池外自管播放器，分屏音频格）同入占有权闸——key 命名空间
+            // 与 busy 不相交（grid:audio: 前缀），恢复侧 busy ?: externals 统一查
+            val wasPlaying = busy.filterValues { it.playWhenReady }.keys.toList() +
+                externals.filterValues { it.playWhenReady }.keys.toList()
             busy.values.forEach { it.pause() }
+            externals.values.forEach { it.pause() }
             android.util.Log.i(
                 "NavGate",
                 "导航闸落下：一刀切暂停 ${busy.size} 路在册（播放意图 ${wasPlaying.size} 路记账）",
@@ -192,7 +196,7 @@ class PlayerPool(
         navIntercepted.clear()
         var resumed = 0
         allKeys.distinct().forEach { k ->
-            busy[k]?.let {
+            (busy[k] ?: externals[k])?.let {
                 it.play()
                 resumed++
             }
@@ -587,13 +591,31 @@ class PlayerPool(
     /** 池外自管播放器登记（格子组合期调用；同 key 重登记=后者顶位，换片重建场景） */
     @Synchronized
     fun attachExternal(key: String, player: ExoPlayer) {
+        externals.remove(key)?.let { old -> externalGateListeners.remove(key)?.let { old.removeListener(it) } }
         externals[key] = player
+        // R417：池外自管播放器同受占有权闸迟到拦截（与池内监听器同手法）
+        val l = object : Player.Listener {
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                if (playWhenReady && navGate) {
+                    synchronized(this@PlayerPool) {
+                        if (key !in navIntercepted) navIntercepted.add(key)
+                    }
+                    player.pause()
+                }
+            }
+        }
+        player.addListener(l)
+        externalGateListeners[key] = l
+        if (navGate && player.playWhenReady) player.pause()
     }
+
+    private val externalGateListeners = HashMap<String, Player.Listener>()
 
     /** 池外自管播放器注销（格子销毁/换片释放前调用；key 不在册为幂等 no-op） */
     @Synchronized
     fun detachExternal(key: String) {
-        externals.remove(key)
+        val p = externals.remove(key)
+        externalGateListeners.remove(key)?.let { l -> p?.removeListener(l) }
     }
 
     /** 只查询不创建：取某 key 登记的池外自管播放器（无则 null；「全部播放」恢复面用） */

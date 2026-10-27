@@ -41,6 +41,12 @@ internal class BoundedLruCache<K, V>(
         synchronized(map) { map[key] = stored }
     }
 
+    /**
+     * 移除单条并返回旧值（未命中返回 null）：TTL 过期清理等调用方主动逐条场景
+     * （R428 searchBotCache 收编——LRU 只管容量上限，条目级过期语义仍归调用方）。
+     */
+    fun remove(key: K): V? = synchronized(map) { map.remove(key) }
+
     /** 当前条数（观测/单测用） */
     fun size(): Int = synchronized(map) { map.size }
 

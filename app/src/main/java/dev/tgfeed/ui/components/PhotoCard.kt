@@ -123,7 +123,9 @@ internal fun PhotoCard(
     onToggleLike: () -> Unit = {},
     // 操作栏：收藏/下载（图片没有声音和倍速，操作栏只挂这三个）
     favorited: Boolean = false,
-    downloadStatus: dev.tgfeed.core.feed.DownloadStatus? = null,
+    // R432 重组收敛：下载表 State 本体下传（卡片内按 item.key 现查），下载 1Hz
+    // 进度不再经值参链把整页拖进重组
+    downloads: androidx.compose.runtime.State<Map<String, dev.tgfeed.core.feed.DownloadStatus>>? = null,
     onToggleFavorite: () -> Unit = {},
     onDownload: () -> Unit = {},
     onOpenChannel: () -> Unit = {},
@@ -179,6 +181,8 @@ internal fun PhotoCard(
     // null=宿主未接深索引，查看器不渲染章导航
     chapterNavigator: (suspend (pages: List<VideoItem>, dir: Int) -> List<VideoItem>?)? = null,
 ) {
+    // R432 重组收敛：叶子查表点（卡片组合期单次读；1Hz 进度只重组下方下载格）
+    val downloadStatus = downloads?.value?.get(item.key)
     // 图集页列表：第 1 张恒为条目自身，其余按 siblings 顺序（防御性去重自身 key）
     val albumPages = remember(item.key, siblings) {
         if (siblings.isEmpty()) listOf(item) else listOf(item) + siblings.filter { it.key != item.key }

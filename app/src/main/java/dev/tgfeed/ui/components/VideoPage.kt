@@ -40,6 +40,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.State
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -128,7 +129,9 @@ internal fun VideoPage(
     playerPool: PlayerPool,
     liked: Boolean,
     favorited: Boolean,
-    downloadStatus: DownloadStatus?,
+    // R432 重组收敛：下载表 State 本体下传（叶子内按 item.key 现查）——原值参链
+    // downloadStatus 贯穿本页到 ActionRail，下载 1Hz 进度更新每次都重组整页
+    downloads: State<Map<String, DownloadStatus>>,
     muted: Boolean,
     speed: Float,
     speedLabel: String,
@@ -564,19 +567,25 @@ internal fun VideoPage(
     }
 
     // 下载结果 Toast：只在状态“迁移”到 Done/Failed 时提示，重组不重复弹
-    var lastDownloadStatus by remember(item.key) { mutableStateOf(downloadStatus) }
-    LaunchedEffect(downloadStatus) {
-        val current = downloadStatus
-        if (current != lastDownloadStatus) {
-            when (current) {
-                is DownloadStatus.Done ->
-                    Toast.makeText(context, "已保存到相册 Movies/TGFeed", Toast.LENGTH_SHORT).show()
-                is DownloadStatus.Failed ->
-                    Toast.makeText(context, "下载失败：${current.message}", Toast.LENGTH_LONG).show()
-                else -> Unit
-            }
-            lastDownloadStatus = current
+    // R432 重组收敛：原值参链 LaunchedEffect(downloadStatus) 键含 progress 实例，
+    // 下载 1Hz 每秒重启 effect 且整页跟着值参重组。改法：
+    //  - 表以 State 本体传入（本页不订阅表本身，1Hz 进度不再触发本页重组）；
+    //  - 类别经 derivedStateOf 派生（表变但类别不变 → 不失效读取方），
+    //    effect 只在 null↔Running↔Done/Failed 类别迁移时重启一次；
+    //  - 语义保真：Toast 仅在「上一个状态是 Running（本会话在飞）」时弹——
+    //    与旧 remember 初始化（已 Done 的条目滑入页面不重弹）行为一致
+    val downloadStatusClass = remember(item.key) {
+        derivedStateOf { downloads.value[item.key]?.javaClass }
+    }
+    var lastDownloadStatus by remember(item.key) { mutableStateOf<DownloadStatus?>(null) }
+    LaunchedEffect(item.key, downloadStatusClass.value) {
+        val current = downloads.value[item.key]
+        if (current is DownloadStatus.Done && lastDownloadStatus is DownloadStatus.Running) {
+            Toast.makeText(context, "已保存到相册 Movies/TGFeed", Toast.LENGTH_SHORT).show()
+        } else if (current is DownloadStatus.Failed && lastDownloadStatus is DownloadStatus.Running) {
+            Toast.makeText(context, "下载失败：${current.message}", Toast.LENGTH_LONG).show()
         }
+        lastDownloadStatus = current
     }
 
     // 封面占位：先秒出 minithumbnail（即时但糊），再异步换高清缩略图；
@@ -1628,7 +1637,8 @@ internal fun VideoPage(
                 onSubscribe = onSubscribe,
                 liked = liked,
                 favorited = favorited,
-                downloadStatus = downloadStatus,
+                downloads = downloads,
+                downloadKey = item.key,
                 // R175 弹幕/分享对调 + 2026-10-16 用户裁决 + R201 整合：右轨分享点按弹
                 // 分享枢纽小菜单（ShareHubSheet 三选一：复制链接/分享到其他应用/分享
                 // 卡片）；弹幕开关在长按面板（见 9）

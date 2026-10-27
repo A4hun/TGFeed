@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -108,5 +109,23 @@
             android:name=".core.feed.IndexCrawlService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- R432 启动性能：移除 androidx.startup 里 WorkManager 的默认主线程预初始化
+            （work-runtime 传递依赖会把 WorkManagerInitializer 挂进 InitializationProvider，
+             进程一创建就在主线程建 WM 内部 Room 库）。改为按需初始化：App 类实现
+             androidx.work.Configuration.Provider，唯一消费方 BackgroundSyncScheduler
+             已在旁路线程调用 getInstance，届时才懒初始化。只摘 WorkManagerInitializer
+             这一条 meta-data，InitializationProvider 本体与 ProfileInstallerInitializer
+             保留（基线性能仍受益）。 -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
     </application>
 </manifest>

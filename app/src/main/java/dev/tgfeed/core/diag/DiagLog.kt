@@ -134,7 +134,8 @@ object DiagLog {
     }
 
     @Synchronized
-    private fun appendRolling(line: String) {
+    private fun appendRolling(line: String) = DiagLogWriter.submit { appendRollingSync(line) }
+    private fun appendRollingSync(line: String) {
         val f = rollingFile() ?: return
         // 超上限先滚动：旧 .1 丢弃，当前整体改名 .1（只留一档历史，诊断够用）
         if (f.length() > MAX_FILE_BYTES) {
@@ -147,6 +148,7 @@ object DiagLog {
 
     @Synchronized
     private fun writeCrash(thread: Thread, error: Throwable) {
+        DiagLogWriter.drain()
         val dir = diagDir ?: return
         val f = File(dir, "crash.log")
         if (f.length() > MAX_CRASH_BYTES) runCatching { f.delete() }

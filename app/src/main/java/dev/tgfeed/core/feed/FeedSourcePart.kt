@@ -243,8 +243,8 @@ internal fun FeedViewModel.showFollowingImpl() {
         // 不去除，图片一直挂到手动刷新）。六道与 pass 谓词同口径：单类型 tab /
         // 设置页类型开关 / 内容筛选 / 屏蔽频道 / 不感兴趣 / 永久指纹。
         val typePrefsR390 = dev.tgfeed.core.prefs.AppPrefs(app)
-        val blockedChR390 = _blockedChannels.value
-        val dislikedKR390 = _dislikedKeys.value
+        // R413：屏蔽频道/不感兴趣/关键词屏蔽收口 VisibilityGate
+        val gateR413 = visibilityGate()
         val permBlockedKeysR390 = _blockedItems.value.mapTo(HashSet()) { it.key }
         val permBlockedUidsR390 = _blockedItems.value.mapNotNullTo(HashSet()) { b ->
             b.fileUniqueId.takeIf { it.isNotEmpty() }
@@ -259,8 +259,7 @@ internal fun FeedViewModel.showFollowingImpl() {
                     typePrefsR390.showAudio,
                     _filter.value,
                 ) &&
-                it.chatId !in blockedChR390 &&
-                it.key !in dislikedKR390 &&
+                gateR413.passes(it) &&
                 !SeenDedupPolicy.isSeen(it, permBlockedKeysR390, permBlockedUidsR390)
         }
         if (snapFresh.isEmpty()) return@launch
@@ -286,23 +285,19 @@ internal fun FeedViewModel.showFollowingImpl() {
  * @return true=成功（含"无订阅/全到底/全已看"这类非失败终态）；false=可重试失败
  */
 internal suspend fun FeedViewModel.warmFollowingSnapshot(): Boolean {
-    val subs = runCatching { store.loadSubscriptions() }.getOrDefault(emptyList())
-    if (subs.isEmpty()) return true // 无订阅：预热无事可做（空态引导是正路），不算失败
-    val src = FollowingFeedSource(gateway, store)
-    val page = runCatching { src.nextPage(FOLLOWING_WARM_PAGE_LIMIT) }.getOrNull() ?: return false
-    if (page.items.isEmpty()) return true // 全到底/空轮：非失败
-    val (seenK, seenU) = runCatching { store.loadSeenIdentities() }
-        .getOrDefault(emptySet<String>() to emptySet())
-    val fresh = page.items.filter { !SeenDedupPolicy.isSeen(it, seenK, seenU) }
-    if (fresh.isEmpty()) return true // 全已看：快照无意义，等真实浏览轮落盘
-    runCatching {
-        store.saveFollowingSnapshot(fresh, if (gateway is MockTdGateway) "demo" else "real")
-    }.onFailure { return false }
-    android.util.Log.i(
-        "FeedViewModel",
-        "R170b 关注流快照预热完成（${fresh.size} 条落盘）",
-    )
-    return true
+    // R420：真身外提到 FollowingSnapshotSync（后台 Worker 共用）；与后台同步同锁互斥，
+    // 后台在途=本轮视为成功跳过（后台正在落同一份快照，不叠拉）
+    val lock = dev.tgfeed.core.sync.FollowingSnapshotSync.lock
+    if (!lock.tryLock()) return true
+    val r = try {
+        dev.tgfeed.core.sync.FollowingSnapshotSync.syncOnce(gateway, store, FOLLOWING_WARM_PAGE_LIMIT)
+    } finally {
+        lock.unlock()
+    }
+    if (r.ok && r.fresh > 0) {
+        android.util.Log.i("FeedViewModel", "R170b 关注流快照预热完成（${r.fresh} 条落盘）")
+    }
+    return r.ok
 }
 
 /** 一键刷合集：切到该合集限定的聚合源（合集内各频道轮流取页混排） */

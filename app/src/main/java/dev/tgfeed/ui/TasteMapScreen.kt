@@ -339,7 +339,14 @@ private const val REVEAL_MS = 1500
  * 钉住**（可见即不逐）；内存账=36 条 × ≤240 样本行投影 ≈ 4MB 峰值上界（常态
  * 井内+预取远低于满帽）。
  */
-private const val PLANET_LRU_CAP = 36
+private const val PLANET_LRU_CAP = 120
+
+/**
+ * R412 每拍装配上限（井内未装配星按井深比近→远取前 N 个，单协程串行装——IO 线程，
+ * 不卡 UI）。旧口径每 400ms 只装 1 个：绕飞扫过的井内星远多于此吞吐=「大部分恒星
+ * 旁边没有行星」用户实锤（2026-10-27 13:2x）。
+ */
+private const val PLANET_ASSEMBLE_PER_BEAT = 4
 
 /** 全池大频道指纹预取数（体量降序 top N——关联弧的主现场是巨头互连） */
 private const val PLANET_PREFETCH_TOP = 24
@@ -515,7 +522,7 @@ private class MapAssembly(
 )
 
 /** 一颗星（频道）在星图上的完整展示态：不可变，布局产出 x/y/z 与天体分档后整体发布 */
-private data class StarNode(
+internal data class StarNode(
     val chatId: Long,
     val title: String,
     val watchSec: Long,
@@ -656,7 +663,7 @@ private class NeighborArc(val chatId: Long, val weight: Int)
  * 观看序列）；total=合并边权（与 [NeighborArc.weight] 同口径——两类账同一证据源）。
  * 传播计数 forwardCount 是 W6 未入库字段——分类账不冒充传播数据（R246 §3.4 挂账）。
  */
-private class NeighborRel(val chatId: Long, val forward: Int, val link: Int, val coWatch: Int) {
+internal class NeighborRel(val chatId: Long, val forward: Int, val link: Int, val coWatch: Int) {
     val total: Int get() = forward + link + coWatch
 }
 
@@ -5240,12 +5247,9 @@ private fun StarInfoCard(
     // StarInfoCard 抽卡后仍 14.6k DEX units/279 寄存器逼近 ART 校验线，同款再拆）
     // ---- R250 信息卡增强状态（动态预览窗/节奏微图/发现日期） ----
     // 代表作预览已装载窗（点=播放；初载 N+N/2，右滑临近尾懒加载下一批——批量
-    // =ceil(N/2)；batch 播放批=当前已装载窗）
-    var previewItems by remember { mutableStateOf<List<VideoItem>>(emptyList()) }
-    // 预览已到尾（空批/短窗/护栏封顶——不再触发装载）
-    var previewExhausted by remember { mutableStateOf(false) }
-    // 预览装载中（防同窗重复触发）
-    var previewLoading by remember { mutableStateOf(false) }
+    // =ceil(N/2)；batch 播放批=当前已装载窗）。R408b：窗三态（items/exhausted/
+    // loading）收编共享件 PreviewWindowState（行星世界卡同件）
+    val previewWin = remember { PreviewWindowState() }
     // 24h 小时直方图（R250 节奏微图原料；null=未装载/无日期证据——微图不出）
     var rhythmHours by remember { mutableStateOf<IntArray?>(null) }
     // 发现日期账（R250：chatId → 发现时刻 ms；0/缺席=存量无日期不冒充）
@@ -5253,22 +5257,17 @@ private fun StarInfoCard(
     // ---- R250 动态预载口径（用户方案）：可见数 N=卡面内容宽÷缩略步长（屏宽
     //      -2×20dp 面板边距-2×GapLg 内衬——LocalConfiguration 算术，零测量竞速）；
     //      初载=N+ceil(N/2)；懒载批=ceil(N/2)。屏幕变（分屏/旋屏）随 screenWidthDp
-    //      重算 ----
-    val previewConf = LocalConfiguration.current
-    val previewN = remember(previewConf.screenWidthDp) {
-        ((previewConf.screenWidthDp - 40 - 2 * TgFeedTokens.GapLg.value.toInt()) / PREVIEW_STEP_DP)
-            .coerceAtLeast(2)
-    }
-    val previewHalf = remember(previewN) { (previewN + 1) / 2 }
+    //      重算（R408b 收编共享口 rememberPreviewDims） ----
+    val previewDims = rememberPreviewDims()
+    val previewN = previewDims.n
+    val previewHalf = previewDims.half
     // 预览 LazyRow 滚动态（remember(selectedId)——换星重建=滚动归零）
     val previewListState = remember(st.chatId) { LazyListState() }
     // ---- R253① 24h 热力条点选状态（发布节奏→代表作时段过滤）：null=未选=全量窗；
-    //      选中=该本地钟点时段窗（hourItems 与 previewItems 同一套动态装载口径——
+    //      选中=该本地钟点时段窗（hourWin 与 previewWin 同一套动态装载口径——
     //      换数据源不换行为：初载 N+ceil(N/2)、懒载批 ceil(N/2)、PREVIEW_MAX 护栏） ----
     var rhythmHour by remember { mutableStateOf<Int?>(null) }
-    var hourItems by remember { mutableStateOf<List<VideoItem>>(emptyList()) }
-    var hourExhausted by remember { mutableStateOf(false) }
-    var hourLoading by remember { mutableStateOf(false) }
+    val hourWin = remember { PreviewWindowState() }
     // ---- R248 点星档案装载（信息卡重设计）：R133 基因行（判词回落层）+ 编年史
     //      摘要（ChannelEraPolicy 纯函数——本地索引频道域聚合）+ 代表作预览
     //      样本（行星 LRU 命中零查询，未命中按需 channelItemsPage）。换星重查，
@@ -5282,23 +5281,19 @@ private fun StarInfoCard(
         chronicle = null
         chronicleLoading = false
         chronicleOpen = false
-        previewItems = emptyList()
-        previewExhausted = false
-        previewLoading = false
+        previewWin.reset()
         rhythmHours = null
         discoveredTs = emptyMap()
         // R253①：热力条点选/时段窗复位（换星回全量预览——点选态不跨星残留）
         rhythmHour = null
-        hourItems = emptyList()
-        hourExhausted = false
-        hourLoading = false
+        hourWin.reset()
         val id = st.chatId
         // R250④：点星即装配（LRU 入口幂等——已装配立即返回；选中星钉住不淘汰）
         runCatching { assemblePlanets(id) }
         genomeLine = runCatching { vm.channelGenomeLine(id) }.getOrNull()
         chronicleLoading = true
         val cachedItems = planetSysSnapshot[id]?.items
-        val initialCount = previewN + previewHalf
+        val initialCount = previewDims.initialCount
         val loaded = withContext(Dispatchers.IO) {
             runCatching {
                 // R250①：初载窗=N+N/2——LRU 命中直接切片零查询（样本同序：近端
@@ -5315,9 +5310,9 @@ private fun StarInfoCard(
         }
         chronicle = loaded?.digest
         rhythmHours = loaded?.hourHist
-        previewItems = loaded?.previews.orEmpty()
         // 短窗=频道条数不足初载数（右滑也无下一批——诚实封窗）
-        previewExhausted = previewItems.size < initialCount
+        previewWin.setInitial(loaded?.previews.orEmpty(), initialCount)
+        val previewItems = previewWin.items
         discoveredTs = loaded?.discovered ?: emptyMap()
         chronicleLoading = false
         android.util.Log.i(
@@ -5383,89 +5378,41 @@ private fun StarInfoCard(
     //      exhausted；previewLoading 只作 collect 内守卫（**不作 effect key**——
     //      key 含它会在装载置位时自取消重启、真机实证两行判定无批次的死循环）。
     //      channelItemsPage messageId 新→旧有界分页——offset=已装载数（与 LRU
-    //      样本同序，两源无缝衔接） ----
-    LaunchedEffect(st.chatId, previewExhausted) {
-        snapshotFlow {
-            val info = previewListState.layoutInfo
-            val end = info.viewportEndOffset
-            val lastFull = info.visibleItemsInfo.lastOrNull { it.offset + it.size <= end }?.index ?: -1
-            lastFull >= 0 && info.totalItemsCount > 0 &&
-                (info.totalItemsCount - 1 - lastFull) < previewHalf
-        }.distinctUntilChanged().collect { shouldLoad ->
-            if (!shouldLoad) return@collect
-            val info2 = previewListState.layoutInfo
-            val lastFull = info2.visibleItemsInfo.lastOrNull { it.offset + it.size <= info2.viewportEndOffset }?.index ?: -1
-            // 判定探针（事件级取证——验证矩阵②：触发时滚动位快照）
+    //      样本同序，两源无缝衔接）。R408b：触发 Effect/批追加（护栏+去重+封窗）
+    //      收编共享件 PreviewNearEndEffect/appendBatch（行星世界卡同件，行为零变化） ----
+    PreviewNearEndEffect(previewListState, previewHalf, st.chatId, previewWin.exhausted) { lastFull, total ->
+        // 判定探针（事件级取证——验证矩阵②：触发时滚动位快照）
+        android.util.Log.i(
+            "TasteMap",
+            "R250 懒载判定: 尾号${(st.chatId % 10000L + 10000L) % 10000L} " +
+                "last全可见=$lastFull total=$total exhausted=${previewWin.exhausted}",
+        )
+        val id = st.chatId
+        // ---- R253① 时段窗模式先行（热力条选中=hourWin 懒载分支；未选=全量窗
+        //      原逻辑。同一 LazyRow 同一触发线——滚动临近尾时装「当前窗」的下一批；
+        //      守卫/批量/护栏/去重与全量窗逐条同口径——同一共享件） ----
+        val h = rhythmHour
+        if (h != null) {
+            val r = hourWin.appendBatch(previewHalf) { offset, limit ->
+                vm.deepIndex.channelItemsByHourPage(id, h, localTzOffsetSec(), limit, offset)
+            } ?: return@PreviewNearEndEffect
             android.util.Log.i(
                 "TasteMap",
-                "R250 懒载判定: 尾号${(st.chatId % 10000L + 10000L) % 10000L} " +
-                    "last全可见=$lastFull total=${info2.totalItemsCount} exhausted=$previewExhausted",
+                "R253 时段批次: 尾号${(id % 10000L + 10000L) % 10000L} 时=$h offset=${r.offset} " +
+                    "到货=${r.fresh} 累计=${hourWin.items.size}（批=${r.batch}" +
+                    if (hourWin.exhausted) " 封窗）" else "）",
             )
-            // ---- R253① 时段窗模式先行（热力条选中=hourItems 懒载分支；未选=全量窗
-            //      原逻辑。同一 LazyRow 同一触发线——滚动临近尾时装「当前窗」的下一批；
-            //      守卫/批量/护栏/去重与全量窗逐条同口径） ----
-            if (rhythmHour != null) {
-                if (hourExhausted || hourLoading) return@collect
-                val id = st.chatId
-                val h = rhythmHour ?: return@collect
-                val offset = hourItems.size
-                if (offset <= 0 || offset >= PREVIEW_MAX) {
-                    hourExhausted = true
-                    return@collect
-                }
-                hourLoading = true
-                val batch = previewHalf
-                val more = withContext(Dispatchers.IO) {
-                    runCatching { vm.deepIndex.channelItemsByHourPage(id, h, localTzOffsetSec(), batch, offset) }
-                        .getOrDefault(emptyList())
-                }
-                // key 去重防御（与全量窗同款——同一 key 不二进窗）
-                val seen = hourItems.mapTo(HashSet(hourItems.size)) { it.key }
-                val fresh = more.filter { it.key !in seen }
-                if (fresh.isEmpty()) {
-                    hourExhausted = true
-                } else {
-                    hourItems = hourItems + fresh
-                    if (hourItems.size >= PREVIEW_MAX) hourExhausted = true
-                }
-                hourLoading = false
-                android.util.Log.i(
-                    "TasteMap",
-                    "R253 时段批次: 尾号${(id % 10000L + 10000L) % 10000L} 时=$h offset=$offset " +
-                        "到货=${fresh.size} 累计=${hourItems.size}（批=$batch" +
-                        if (hourExhausted) " 封窗）" else "）",
-                )
-                return@collect
-            }
-            if (previewExhausted || previewLoading) return@collect
-            val id = st.chatId
-            val offset = previewItems.size
-            if (offset <= 0 || offset >= PREVIEW_MAX) {
-                previewExhausted = true
-                return@collect
-            }
-            previewLoading = true
-            val batch = previewHalf
-            val more = withContext(Dispatchers.IO) {
-                runCatching { vm.deepIndex.channelItemsPage(id, batch, offset) }.getOrDefault(emptyList())
-            }
-            // key 去重防御（装载窗与索引增量竞速的极端位错——同一 key 不二进窗）
-            val seen = previewItems.mapTo(HashSet(previewItems.size)) { it.key }
-            val fresh = more.filter { it.key !in seen }
-            if (fresh.isEmpty()) {
-                previewExhausted = true
-            } else {
-                previewItems = previewItems + fresh
-                if (previewItems.size >= PREVIEW_MAX) previewExhausted = true
-            }
-            previewLoading = false
-            android.util.Log.i(
-                "TasteMap",
-                "R250 预览批次: 尾号${(id % 10000L + 10000L) % 10000L} offset=$offset " +
-                    "到货=${fresh.size} 累计=${previewItems.size}（N=$previewN 批=$batch" +
-                    if (previewExhausted) " 封窗）" else "）",
-            )
+            return@PreviewNearEndEffect
         }
+        val r = previewWin.appendBatch(previewHalf) { offset, limit ->
+            vm.deepIndex.channelItemsPage(id, limit, offset)
+        } ?: return@PreviewNearEndEffect
+        android.util.Log.i(
+            "TasteMap",
+            "R250 预览批次: 尾号${(id % 10000L + 10000L) % 10000L} offset=${r.offset} " +
+                "到货=${r.fresh} 累计=${previewWin.items.size}（N=$previewN 批=${r.batch}" +
+                if (previewWin.exhausted) " 封窗）" else "）",
+        )
     }
 
     // ---- R253① 时段窗初载（热力条点选→代表作过滤为该时段发布内容）：选中即取
@@ -5477,26 +5424,22 @@ private fun StarInfoCard(
     LaunchedEffect(st.chatId, rhythmHour) {
         // 模式/换星切换：预览滚动位归零（两窗同一 LazyRow，换窗从最新格看起）
         runCatching { previewListState.scrollToItem(0) }
-        hourItems = emptyList()
-        hourExhausted = false
-        hourLoading = false
+        hourWin.reset()
         val id = st.chatId
         val h = rhythmHour ?: return@LaunchedEffect
-        val initialCount = previewN + previewHalf
-        hourLoading = true
+        val initialCount = previewDims.initialCount
+        hourWin.loading = true
         val loaded = withContext(Dispatchers.IO) {
             runCatching { vm.deepIndex.channelItemsByHourPage(id, h, localTzOffsetSec(), initialCount, 0) }
                 .getOrDefault(emptyList())
         }
         // 换星/换时段竞速护栏：装载结果只回写当前选中星的当前选中时段
         if (st.chatId == id && rhythmHour == h) {
-            hourItems = loaded
-            hourExhausted = loaded.size < initialCount
-            hourLoading = false
+            hourWin.setInitial(loaded, initialCount)
             android.util.Log.i(
                 "TasteMap",
                 "R253 时段窗口: 尾号${(id % 10000L + 10000L) % 10000L} 时=$h " +
-                    "到货=${loaded.size}（初载=$initialCount${if (hourExhausted) "·封窗" else ""}）",
+                    "到货=${loaded.size}（初载=$initialCount${if (hourWin.exhausted) "·封窗" else ""}）",
             )
         }
     }
@@ -5572,9 +5515,9 @@ private fun StarInfoCard(
         StarCardPreviewSection(
             st = st,
             rhythmHour = rhythmHour,
-            previewItems = previewItems,
-            hourItems = hourItems,
-            hourExhausted = hourExhausted,
+            previewItems = previewWin.items,
+            hourItems = hourWin.items,
+            hourExhausted = hourWin.exhausted,
             previewListState = previewListState,
             gateway = gateway,
             onPlayDust = onPlayDust,
@@ -5714,13 +5657,13 @@ private fun StarInfoCard(
         //      折叠（密度红线：每卷 ≤3 信息组）——全部同 sheet 内不跳页 ----
         // R258：整体迁出 StarCardChronicleVolumes（vol1~6Open 随迁=唯一消费位；
         // playWork/playMilestone/playReturn 局部函数随迁——语句原样零行为变化）
-        StarCardChronicleVolumes(
+        StarChronicleDossier(
             st = st,
             chronicleOpen = chronicleOpen,
             chron = chron,
             chronicleLoading = chronicleLoading,
             chronVolumes = chronVolumes,
-            mapData = mapData,
+            neighborRels = mapData?.neighborRels?.get(st.chatId).orEmpty(),
             starsById = starsById,
             gateway = gateway,
             onFlyStar = onFlyStar,
@@ -5881,26 +5824,169 @@ private fun StarCardPreviewSection(
                     color = TgFeedTokens.TextLow,
                 )
             } else {
-                LazyRow(
-                    state = previewListState,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.Top,
-                ) {
-                    items(displayPreview, key = { it.key }) { item ->
-                        PreviewThumbCell(item = item, gateway = gateway) {
-                            onPlayDust(
-                                item,
-                                displayPreview,
-                                if (rhythmHour != null) {
-                                    "时段代表作 · ${st.title.ifBlank { "频道" }}"
-                                } else {
-                                    "频道代表作 · ${st.title.ifBlank { "频道" }}"
-                                },
-                            )
-                        }
-                    }
+                // R408b：LazyRow 收编共享件 PreviewThumbRow（行星世界卡同件）
+                PreviewThumbRow(
+                    items = displayPreview,
+                    listState = previewListState,
+                    gateway = gateway,
+                ) { item ->
+                    onPlayDust(
+                        item,
+                        displayPreview,
+                        if (rhythmHour != null) {
+                            "时段代表作 · ${st.title.ifBlank { "频道" }}"
+                        } else {
+                            "频道代表作 · ${st.title.ifBlank { "频道" }}"
+                        },
+                    )
                 }
             }
+        }
+    }
+}
+
+// ---------------- R408b 代表作动态装载共享件（恒星信息卡 R250/R253 原逻辑抽出——
+//      恒星信息卡全量窗/时段窗 + 行星世界卡同一套：可见数 N 与半批口径、初载 N+ceil(N/2)、
+//      右滑临近尾懒载 ceil(N/2)、PREVIEW_MAX 护栏、key 去重、空批封窗。一处改两卡生效） ----
+
+/** 代表作可见数 N 与半批（懒载批量/触发线）口径；初载=N+half */
+internal data class PreviewDims(val n: Int, val half: Int) {
+    val initialCount: Int get() = n + half
+}
+
+/**
+ * 可见数 N 纯函数：卡面内容宽（屏宽-2×20dp 面板边距-2×GapLg 内衬）÷缩略步长，下限 2。
+ * 恒星信息卡与行星世界卡同一卡壳几何（同边距同内衬），同一把尺子。
+ */
+internal fun previewDimsOf(screenWidthDp: Int, gapLgDp: Int): PreviewDims {
+    val n = ((screenWidthDp - 40 - 2 * gapLgDp) / PREVIEW_STEP_DP).coerceAtLeast(2)
+    return PreviewDims(n, (n + 1) / 2)
+}
+
+/** 屏幕变（分屏/旋屏）随 screenWidthDp 重算——LocalConfiguration 算术，零测量竞速 */
+@Composable
+private fun rememberPreviewDims(): PreviewDims {
+    val conf = LocalConfiguration.current
+    return remember(conf.screenWidthDp) {
+        previewDimsOf(conf.screenWidthDp, TgFeedTokens.GapLg.value.toInt())
+    }
+}
+
+/** 代表作动态窗状态（一窗一份：已装载窗/到尾/装载中——装载中只作守卫，不作 effect key） */
+@androidx.compose.runtime.Stable
+private class PreviewWindowState {
+    var items by mutableStateOf<List<VideoItem>>(emptyList())
+    var exhausted by mutableStateOf(false)
+    var loading by mutableStateOf(false)
+
+    fun reset() {
+        items = emptyList()
+        exhausted = false
+        loading = false
+    }
+
+    /** 初载落窗：短窗（不足初载数）=诚实封窗（右滑也无下一批） */
+    fun setInitial(loaded: List<VideoItem>, initialCount: Int) {
+        items = loaded
+        exhausted = loaded.size < initialCount
+        loading = false
+    }
+}
+
+/** 懒载批合并结果（纯函数产物） */
+internal data class PreviewMerge<T>(val items: List<T>, val freshCount: Int, val exhausted: Boolean)
+
+/**
+ * 懒载批合并纯函数：key 去重（装载窗与索引增量竞速的极端位错——同一 key 不二进窗）；
+ * 空批∨全重=封窗；累计 ≥ max（护栏）=封窗。
+ */
+internal fun <T> mergePreviewBatch(
+    current: List<T>,
+    more: List<T>,
+    max: Int,
+    keyOf: (T) -> Any,
+): PreviewMerge<T> {
+    val seen = current.mapTo(HashSet(current.size)) { keyOf(it) }
+    val fresh = more.filter { keyOf(it) !in seen }
+    if (fresh.isEmpty()) return PreviewMerge(current, 0, true)
+    val merged = current + fresh
+    return PreviewMerge(merged, fresh.size, merged.size >= max)
+}
+
+/** 懒载批次执行回执（调用侧打探针用） */
+private data class PreviewAppendOutcome(val offset: Int, val fresh: Int, val batch: Int)
+
+/**
+ * 懒载下一批（含护栏+去重+封窗）：守卫 exhausted/loading；offset=已装载数（与初载同序
+ * 无缝衔接）；offset 越护栏即封窗不取数（返回 null）；fetch 在 IO 线程、异常=空批=封窗。
+ */
+private suspend fun PreviewWindowState.appendBatch(
+    batch: Int,
+    fetch: (offset: Int, limit: Int) -> List<VideoItem>,
+): PreviewAppendOutcome? {
+    if (exhausted || loading) return null
+    val offset = items.size
+    if (offset <= 0 || offset >= PREVIEW_MAX) {
+        exhausted = true
+        return null
+    }
+    loading = true
+    val more = withContext(Dispatchers.IO) {
+        runCatching { fetch(offset, batch) }.getOrDefault(emptyList())
+    }
+    val merged = mergePreviewBatch(items, more, PREVIEW_MAX) { it.key }
+    items = merged.items
+    if (merged.exhausted) exhausted = true
+    loading = false
+    return PreviewAppendOutcome(offset, merged.freshCount, batch)
+}
+
+/**
+ * 临近尾触发 Effect（R250 原形）：snapshotFlow 观察 LazyRow 滚动位；触发线只算**完全
+ * 可见**格（半露格会把触发线前移一格=未滑即触发）；末位全可见距已装载尾 < half（严格）
+ * 即触发 onNearEnd(lastFull, total)。keys 由调用侧给（换窗/封窗重启）；onNearEnd 走
+ * rememberUpdatedState——effect 不因 lambda 重建而重启。
+ */
+@Composable
+private fun PreviewNearEndEffect(
+    listState: LazyListState,
+    half: Int,
+    vararg keys: Any?,
+    onNearEnd: suspend (lastFull: Int, total: Int) -> Unit,
+) {
+    val latest by androidx.compose.runtime.rememberUpdatedState(onNearEnd)
+    LaunchedEffect(*keys) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val end = info.viewportEndOffset
+            val lastFull = info.visibleItemsInfo.lastOrNull { it.offset + it.size <= end }?.index ?: -1
+            lastFull >= 0 && info.totalItemsCount > 0 &&
+                (info.totalItemsCount - 1 - lastFull) < half
+        }.distinctUntilChanged().collect { shouldLoad ->
+            if (!shouldLoad) return@collect
+            val info2 = listState.layoutInfo
+            val lastFull = info2.visibleItemsInfo
+                .lastOrNull { it.offset + it.size <= info2.viewportEndOffset }?.index ?: -1
+            latest(lastFull, info2.totalItemsCount)
+        }
+    }
+}
+
+/** 代表作 LazyRow 行（3:4 缩略格 PreviewThumbCell；点=onPlay(该条)） */
+@Composable
+private fun PreviewThumbRow(
+    items: List<VideoItem>,
+    listState: LazyListState,
+    gateway: TdGateway,
+    onPlay: (VideoItem) -> Unit,
+) {
+    LazyRow(
+        state = listState,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        items(items, key = { it.key }) { item ->
+            PreviewThumbCell(item = item, gateway = gateway) { onPlay(item) }
         }
     }
 }
@@ -6622,7 +6708,8 @@ private fun StarCardNeighbors(
 }
 
 /** R258 按钮行（原块迁出零变化）：[试吃]（主=onOpenChannel 原链）[订阅]
- *（vm.addSubscription 本地订阅写——口内查重；已订阅置灰） */
+ *（vm.addSubscription 本地订阅写——口内查重；已订阅置灰）[入单]（R387 星图腿：
+ * 把这台排进播放队列=「看到→存队列→按序播」的星图入口；幂等分流 Toast） */
 @Composable
 private fun StarCardButtons(
     st: StarNode,
@@ -6674,6 +6761,28 @@ private fun StarCardButtons(
         ) {
             Text(
                 if (subscribedNow) "已订阅" else "订阅",
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+            )
+        }
+        // R387 入单（星图腿）：点星试吃面板里「把这台排进节目单」——存进播放队列
+        // 按序播（r387_notes §3.2）；同 chatId 幂等（已在单=Toast 分流不重复入）。
+        // 主 composable 零触碰（本函数独立件=预算闸 TasteMapMethodBudgetTest 只数
+        // 主函数体行数，笔前对账：主函数行数零增）
+        TextButton(
+            onClick = {
+                val added = vm.enqueueChannelToPlayQueue(st.chatId, st.title.ifBlank { "频道" })
+                Toast.makeText(
+                    context,
+                    if (added) "已排进播放队列" else "已在播放队列里",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            },
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(TgFeedTokens.RadiusPill),
+        ) {
+            Text(
+                "入单",
                 style = MaterialTheme.typography.labelLarge,
                 maxLines = 1,
             )
@@ -8207,8 +8316,19 @@ private suspend fun assemblePlanetSystemR254(ctx: GalaxyLogicCtx, chatId: Long) 
         //（双 IO 浪费+重复 put 的 LRU 顺序扰动一并收口）
         if (ctx.planetLru.containsKey(chatId)) return
         if (ctx.planetLru.size >= PLANET_LRU_CAP) {
-            val victim = ctx.planetLru.keys.firstOrNull { it !in pinned }
+            var victim = ctx.planetLru.keys.firstOrNull { it !in pinned }
             if (victim == null) {
+                // R412：帽被井内钉满时不再整拒——驱逐井内**最远**者（焦点三态永不逐）。
+                // 旧口径诚实拒绝=新飞近的星永远装不上（13:23 设备实锚 在住=36 帽=36）；
+                // 最远者=行星层最暗/最小的一颗，换给更近的星=可见收益最大
+                val focus = HashSet<Long>(4)
+                ctx.selectedId.value?.let { focus += it }
+                if (ctx.nearFocusId.longValue != 0L) focus += ctx.nearFocusId.longValue
+                if (ctx.dustChatId.longValue != 0L) focus += ctx.dustChatId.longValue
+                victim = inWellFarthestFirstR412.firstOrNull { it in ctx.planetLru && it !in focus && it != chatId }
+            }
+            if (victim == null) {
+                planetRefuseTotalR412.incrementAndGet()
                 // 诚实拒绝（零驱逐零装入）：帽被井内可见域占满——宁可拒不装也不闪可见层
                 //（探针一星一记会话去重，计数口径零内容）
                 if (ctx.planetRefuseLog.add(chatId)) {
@@ -8221,6 +8341,7 @@ private suspend fun assemblePlanetSystemR254(ctx: GalaxyLogicCtx, chatId: Long) 
                 return
             }
             ctx.planetLru.remove(victim)
+            planetEvictTotalR412.incrementAndGet()
         }
         ctx.planetLru[chatId] = entry
         ctx.planetSysSnapshot.value = HashMap(ctx.planetLru)
@@ -8315,6 +8436,9 @@ private suspend fun CoroutineScope.pollGalaxyBeatsR254(
     channelStars: List<StarNode>,
     wellMaxVol: Int,
 ) {
+    // R412 行星覆盖体检探针（纯计数零内容）：入场 10s 一行全池账本覆盖分布，
+    // 此后每 30s 一行井内覆盖（井内星/已装配/有行星/LRU 在住/累计拒绝）
+    launch { planetCoverageProbeR412(ctx, channelStars) }
     // 大频道指纹预取（体量降序 top N，错峰——不抢装配/爬虫 IO）
     launch {
         for (s in channelStars.sortedByDescending { it.itemsCount }.take(PLANET_PREFETCH_TOP)) {
@@ -8331,6 +8455,7 @@ private suspend fun CoroutineScope.pollGalaxyBeatsR254(
         var bestDust = 0L
         var bestDustDist = Float.MAX_VALUE
         var wantAssemble = 0L
+        val wantList = ArrayList<Pair<Long, Float>>(16) // R412 本拍井内未装配候选
         var wantRatio = Float.MAX_VALUE
         val cachedIds = synchronized(ctx.planetLru) { ctx.planetLru.keys.toHashSet() }
         // ---- R248 星名点亮检测（一拍收集）：未知频道星 井深比 < DISCOVER_RATIO
@@ -8340,6 +8465,7 @@ private suspend fun CoroutineScope.pollGalaxyBeatsR254(
         val newly = ArrayList<StarNode>(4)
         // R367 井内可见域收集（驱逐钉住原料——与渲染门同一阈 APPEAR_RATIO，N 体当帧位）
         val wellIds = ArrayList<Long>(16)
+        val wellRatios = ArrayList<Pair<Long, Float>>(16) // R412 驱逐序原料（远→近）
         val probe = FloatArray(4) // 本协程局部投影暂存（每拍复用零分配）
         val focalD = TasteSpace.focalOf(
             cv.width.toFloat(), cv.height.toFloat(),
@@ -8359,7 +8485,10 @@ private suspend fun CoroutineScope.pollGalaxyBeatsR254(
             val dist = TasteSpace.distTo(cam, sx, sy, sz)
             val ahead = dist > TasteSpace.NEAR // 近裁面后的星不焦不尘埃（不可见）
             // R367 井内可见域入集（含未装配——钉住语义=「若已在 LRU 则不可逐」）
-            if (ahead && ratio < TasteTagPlanets.APPEAR_RATIO) wellIds += s.chatId
+            if (ahead && ratio < TasteTagPlanets.APPEAR_RATIO) {
+                wellIds += s.chatId
+                wellRatios += s.chatId to ratio
+            }
             // 近焦星：井深比最小且已进行星浮现档（关联弧的「飞近焦点态」）
             if (ahead && ratio < bestNearRatio && ratio < TasteTagPlanets.APPEAR_RATIO) {
                 bestNearRatio = ratio
@@ -8374,6 +8503,10 @@ private suspend fun CoroutineScope.pollGalaxyBeatsR254(
                 bestDust = s.chatId
             }
             // 井内但未装配（=行星层真正点亮域；预取余量 1.0× 真机校准口径）
+            // R412：收集全部候选（下方按井深比近→远取前 PLANET_ASSEMBLE_PER_BEAT 个）
+            if (ratio < TasteTagPlanets.APPEAR_RATIO && s.chatId !in cachedIds) {
+                wantList += s.chatId to ratio
+            }
             if (ratio < wantRatio && ratio < TasteTagPlanets.APPEAR_RATIO && s.chatId !in cachedIds) {
                 wantRatio = ratio
                 wantAssemble = s.chatId
@@ -8389,6 +8522,7 @@ private suspend fun CoroutineScope.pollGalaxyBeatsR254(
         }
         // R367 井内可见域发布（整集换血零陈值——星漂出井一拍内即失钉，井外可逐）
         ctx.inWellIds.value = wellIds.toHashSet()
+        inWellFarthestFirstR412 = wellRatios.sortedByDescending { it.second }.map { it.first }
         // ---- R248 发现时刻（一拍批量）：集合更新+会话动画账+爆散+持久化+成就
         //      重评+空名补捞（装配时点标题快照之后才到账的频道名——发现机制
         //      的「星名浮现」不能被装配竞速饿死：活图/金矿现查回填 mapData） ----
@@ -8546,14 +8680,82 @@ private suspend fun CoroutineScope.pollGalaxyBeatsR254(
         }
         if (wantAssemble != 0L && !ctx.planetAssembling.value) {
             ctx.planetAssembling.value = true
+            // R412：每拍按井深比近→远串行装前 N 个（单飞锁不变=同一时刻至多一个装配协程）
+            val batch = wantList.sortedBy { it.second }.take(PLANET_ASSEMBLE_PER_BEAT).map { it.first }
             launch {
                 try {
-                    runCatching { assemblePlanetSystemR254(ctx, wantAssemble) }
+                    for (id in batch) runCatching { assemblePlanetSystemR254(ctx, id) }
                 } finally {
                     ctx.planetAssembling.value = false
                 }
             }
         }
+    }
+}
+
+/** R412 累计装配拒绝/驱逐计数（会话进程级，探针口径——零内容） */
+private val planetRefuseTotalR412 = java.util.concurrent.atomic.AtomicInteger(0)
+private val planetEvictTotalR412 = java.util.concurrent.atomic.AtomicInteger(0)
+
+/** R412 井内星按井深比远→近序（轮询每拍整表换装发布——帽满时驱逐最远者的原料） */
+@Volatile
+private var inWellFarthestFirstR412: List<Long> = emptyList()
+
+/** R412 行星覆盖体检（纯计数零内容；IO 线程查库） */
+private suspend fun planetCoverageProbeR412(ctx: GalaxyLogicCtx, channelStars: List<StarNode>) {
+    delay(10_000L)
+    val ids = channelStars.map { it.chatId }
+    val rows = withContext(Dispatchers.IO) {
+        runCatching { ctx.vm.deepIndex.planetCoverageCounts(ids, TasteTagPlanets.SAMPLE_LIMIT) }
+            .getOrDefault(emptyList())
+    }
+    val incomplete = withContext(Dispatchers.IO) {
+        runCatching { ctx.vm.deepIndex.tagCoverageLikelyIncomplete() }.getOrDefault(true)
+    }
+    var l0 = 0; var l13 = 0; var l49 = 0; var l10 = 0
+    var noSampleRows = 0; var sampleAllNull = 0; var sampleNoTag = 0; var zeroPlanet = 0
+    var sNull = 0L; var sEmpty = 0L; var sTagged = 0L; var sRows = 0L
+    for (r in rows) {
+        when {
+            r.ledgerTags == 0 -> l0++
+            r.ledgerTags <= 3 -> l13++
+            r.ledgerTags <= 9 -> l49++
+            else -> l10++
+        }
+        sRows += r.sampleRows; sNull += r.sampleNull; sEmpty += r.sampleEmpty; sTagged += r.sampleTagged
+        if (r.sampleRows == 0) noSampleRows++
+        else if (r.sampleNull == r.sampleRows) sampleAllNull++
+        if (r.sampleTagged == 0) sampleNoTag++
+        if (r.ledgerTags == 0 && r.sampleTagged == 0) zeroPlanet++
+    }
+    android.util.Log.i(
+        "TasteMap",
+        "R412 行星覆盖: 全池恒星=${channelStars.size} 查得=${rows.size} 账本非空=${rows.size - l0} " +
+            "账本分布 0=${l0} 1-3=${l13} 4-9=${l49} 10+=${l10} | 零行星(账本空且样本无tag)=${zeroPlanet} " +
+            "样本无行=${noSampleRows} 样本全未解析=${sampleAllNull} 样本无tag=${sampleNoTag} | " +
+            "样本行=${sRows} 未解析=${sNull} 已解析无tag=${sEmpty} 有tag=${sTagged} | " +
+            "回填未完成=${incomplete} LRU在住=${synchronized(ctx.planetLru) { ctx.planetLru.size }} " +
+            "累计拒绝=${planetRefuseTotalR412.get()} 累计驱逐=${planetEvictTotalR412.get()}",
+    )
+    while (true) {
+        delay(30_000L)
+        val well = ctx.inWellIds.value
+        var assembled = 0; var withPlanets = 0
+        val lruSize: Int
+        synchronized(ctx.planetLru) {
+            lruSize = ctx.planetLru.size
+            for (id in well) {
+                val e = ctx.planetLru[id] ?: continue
+                assembled++
+                if (e.system.planets.isNotEmpty()) withPlanets++
+            }
+        }
+        android.util.Log.i(
+            "TasteMap",
+            "R412 井内覆盖: 井内星=${well.size} 已装配=${assembled} 有行星=${withPlanets} " +
+                "LRU在住=${lruSize} 帽=${PLANET_LRU_CAP} 累计拒绝=${planetRefuseTotalR412.get()} " +
+                "累计驱逐=${planetEvictTotalR412.get()}",
+        )
     }
 }
 
@@ -12592,7 +12794,7 @@ private val ChronicleRhythmFlowHeight = 52.dp
  * 卡消费位写域外零碰）。空月零绘制（缺据不出）。
  */
 @Composable
-private fun ChronicleRhythmFlowCanvas(monthly: List<ChannelEraPolicy.MonthCount>) {
+internal fun ChronicleRhythmFlowCanvas(monthly: List<ChannelEraPolicy.MonthCount>) {
     Canvas(
         Modifier
             .fillMaxWidth()
@@ -12898,16 +13100,16 @@ private const val CHRON_CHAIN_SAMPLE = 800
 private const val CHRON_DAY_WINDOW_LIMIT = 64
 
 /** R251 峰作品行：纯函数产出 + 可播放条目（null=窗口取条降级——行仍出，点不可用） */
-private class PeakWorkRow(val work: ChannelEraPolicy.PeakWork, val item: VideoItem?)
+internal class PeakWorkRow(val work: ChannelEraPolicy.PeakWork, val item: VideoItem?)
 
 /** R251 里程碑行（④：label=创刊/第 N 条/系列开篇；item=null 不可点） */
-private class MilestoneRow(val ms: ChannelEraPolicy.Milestone, val item: VideoItem?)
+internal class MilestoneRow(val ms: ChannelEraPolicy.Milestone, val item: VideoItem?)
 
 /** R251 沉寂行（⑤：returned 且取到回归日首条才可点播放） */
-private class DormantRow(val h: ChannelEraPolicy.Hiatus, val returnItem: VideoItem?)
+internal class DormantRow(val h: ChannelEraPolicy.Hiatus, val returnItem: VideoItem?)
 
 /** R251 四卷卷宗（⑥互联不在内——装配期 neighborRels 直供零查询） */
-private class ChronicleVolumes(
+internal class ChronicleVolumes(
     val works: List<PeakWorkRow>,
     val milestones: List<MilestoneRow>,
     val dormant: List<DormantRow>,
@@ -13186,7 +13388,7 @@ private fun VolumeFold(open: Boolean, content: @Composable AnimatedVisibilitySco
  * 数据薄不出卷）；对端星不在图=行不出现（账面双方都在池内才建——正常恒在）。
  */
 @Composable
-private fun ChronicleInterlinkVolume(
+internal fun ChronicleInterlinkVolume(
     rels: List<NeighborRel>,
     starsById: Map<Long, StarNode>,
     open: Boolean,
@@ -13303,8 +13505,9 @@ private class WorldCamState {
  *
  * 行星属主语义三层各就各位（诚实口径分行标注）：
  *  - 该频道层：条数（账本口径——topTags 全频道历史）+ 时期弧（该 tag 月度发布
- *    柱条，ChannelEraPolicy 族分桶同尺）+ 代表作封面墙（行星 itemIdx 近端样本
- *    最新 6 条，点=onPlayDust 单条直播原链）；
+ *    柱条，ChannelEraPolicy 族分桶同尺）+ 代表作（R408b 起动态装载：该频道+该 tag
+ *    索引分页，恒星信息卡共享件同口径；索引无货回落行星 itemIdx 近端样本，
+ *    点=onPlayDust 单条直播原链）；
  *  - 跨恒星层：同 tag 其他恒星 pills（tagChannels 全站账本 ∩ 在图星——点=飞过去
  *    +卡片换绑，世界卡同时是虫洞的图形化宿主：长按行星的虫洞菜单原样保留）；
  *  - 全宇宙层：「▶ 直接开刷」=该 tag 全宇宙内容流（R269 语义锚）。
@@ -13338,11 +13541,66 @@ private fun PlanetWorldCard(
     val entry = planetSysSnapshot[target.chatId]
     val foldTag = remember(target.tag) { SearchTextKit.fold(target.tag) }
     val planet = entry?.system?.planets?.firstOrNull { SearchTextKit.fold(it.tag) == foldTag }
-    // 代表作封面墙：行星 itemIdx（发布时间升序）倒序=近端样本最新——尘埃播放批同序
-    val covers = remember(entry, target.tag) {
+    // 代表作快照样本（回落源）：行星 itemIdx（发布时间升序）倒序=近端样本最新——尘埃播放批同序
+    val sampleCovers = remember(entry, target.tag) {
         val p = planet ?: return@remember emptyList<VideoItem>()
-        p.itemIdx.reversed().mapNotNull { entry?.items?.getOrNull(it) }.take(6)
+        p.itemIdx.reversed().mapNotNull { entry?.items?.getOrNull(it) }
     }
+    // ---- R408b 代表作动态装载（用户令：行星卡代表作逻辑参考恒星信息卡代表作）——
+    //      收编恒星信息卡共享件：可见数 N/半批同尺（rememberPreviewDims）、初载 N+ceil(N/2)、
+    //      右滑临近尾懒载 ceil(N/2)（PreviewNearEndEffect+appendBatch：护栏 PREVIEW_MAX+
+    //      key 去重+空批封窗）。数据源=本地深度索引「该频道+该 tag」分页
+    //      （channelTagItemsPage，messageId 新→旧，恒星侧 channelItemsPage 同序口径）；
+    //      索引查不到（未覆盖/查询失败）回落快照样本并封窗（诚实降级——样本不分页） ----
+    val coverDims = rememberPreviewDims()
+    val coverWin = remember(target.chatId, foldTag) { PreviewWindowState() }
+    val coverListState = remember(target.chatId, foldTag) { LazyListState() }
+    var coverFromIndex by remember(target.chatId, foldTag) { mutableStateOf(false) }
+    // 初载 effect 跨 IO 挂起后读最新样本（装配在途样本可能已刷新——防陈旧捕获）
+    val latestSample by androidx.compose.runtime.rememberUpdatedState(sampleCovers)
+    LaunchedEffect(target.chatId, foldTag) {
+        val id = target.chatId
+        val tag = target.tag
+        val initialCount = coverDims.initialCount
+        coverWin.loading = true
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching { vm.deepIndex.channelTagItemsPage(id, tag, initialCount, 0) }
+                .getOrDefault(emptyList())
+        }
+        if (loaded.isNotEmpty()) {
+            coverFromIndex = true
+            coverWin.setInitial(loaded, initialCount)
+        } else {
+            coverFromIndex = false
+            coverWin.setInitial(latestSample, Int.MAX_VALUE) // 回落样本=封窗
+        }
+        android.util.Log.i(
+            "TasteMap",
+            "R408b 世界卡代表作初载: 源=${if (coverFromIndex) "索引" else "样本回落"} " +
+                "到货=${coverWin.items.size}（N=${coverDims.n} 初载=$initialCount" +
+                "${if (coverWin.exhausted) "·封窗" else ""}）",
+        )
+    }
+    // 快照样本晚到（行星系统装配在途）且索引无货：回落窗随样本刷新
+    LaunchedEffect(sampleCovers) {
+        if (!coverFromIndex && !coverWin.loading && sampleCovers.isNotEmpty()) {
+            coverWin.setInitial(sampleCovers, Int.MAX_VALUE)
+        }
+    }
+    PreviewNearEndEffect(coverListState, coverDims.half, target.chatId, foldTag, coverWin.exhausted) { _, _ ->
+        if (!coverFromIndex) return@PreviewNearEndEffect
+        val id = target.chatId
+        val tag = target.tag
+        val r = coverWin.appendBatch(coverDims.half) { offset, limit ->
+            vm.deepIndex.channelTagItemsPage(id, tag, limit, offset)
+        } ?: return@PreviewNearEndEffect
+        android.util.Log.i(
+            "TasteMap",
+            "R408b 世界卡代表作批次: offset=${r.offset} 到货=${r.fresh} 累计=${coverWin.items.size}" +
+                "（批=${r.batch}${if (coverWin.exhausted) " 封窗" else ""}）",
+        )
+    }
+    val covers = coverWin.items
     // 时期弧（该频道该 tag 月度柱——GalaxyPortholeLoader 共享装载层；IO 毫秒级）
     val era by produceState<GalaxyPortholeLoader.TagEraInfo?>(null, target.chatId, target.tag) {
         value = withContext(Dispatchers.IO) {
@@ -13476,7 +13734,7 @@ private fun PlanetWorldCard(
             count = itemCount,
             kindCounts = kindCounts,
         )
-        // ---- 代表作封面墙（近端样本最新 6 条；点=单条直播原链；批=当前墙） ----
+        // ---- 代表作（R408b 动态装载：共享件 PreviewThumbRow；点=单条直播原链；批=当前已装载窗） ----
         if (covers.isNotEmpty()) {
             Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 Text(
@@ -13484,20 +13742,16 @@ private fun PlanetWorldCard(
                     style = MaterialTheme.typography.labelSmall,
                     color = TgFeedTokens.TextLow,
                 )
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(TgFeedTokens.GapSm)) {
-                    items(covers, key = { it.key }) { item ->
-                        PreviewThumbCell(
-                            item = item,
-                            gateway = gateway,
-                            onPlay = {
-                                android.util.Log.i(
-                                    "TasteMap",
-                                    "R301 世界卡代表作: 播放该条（批 ${covers.size} 条）",
-                                )
-                                onPlayDust(item, covers, "行星世界 · #${target.tag}")
-                            },
-                        )
-                    }
+                PreviewThumbRow(
+                    items = covers,
+                    listState = coverListState,
+                    gateway = gateway,
+                ) { item ->
+                    android.util.Log.i(
+                        "TasteMap",
+                        "R301 世界卡代表作: 播放该条（批 ${covers.size} 条）",
+                    )
+                    onPlayDust(item, covers, "行星世界 · #${target.tag}")
                 }
             }
         }

@@ -42,7 +42,9 @@ class R392WiringSourceTest {
     private fun src(path: String): String {
         val file = File(mainSourceRoot, path)
         assertTrue("源文件必须存在：${file.path}", file.isFile)
-        return file.readText()
+        // 行尾归一：autocrlf 检出形态（CRLF/LF）不得漂移多行锚（精度判词 startsWith
+        // 逐字比对——R423 锚修：worktree 重检出后 CRLF 致锚假红）
+        return file.readText().replace("\r\n", "\n")
     }
 
     private fun glShaders(): String = src("dev/tgfeed/ui/gl/GlShaders.kt")

@@ -601,8 +601,7 @@ internal suspend fun FeedViewModel.scanFreshSubscriptionItemsImpl(): List<VideoI
     // "在别处看过的同片换了频道再置顶"是用户最恼火的重复形态之一
     val (seenKeys, seenUids) = runCatching { store.loadSeenIdentities() }
         .getOrDefault(emptySet<String>() to emptySet())
-    val blocked = _blockedChannels.value
-    val disliked = _dislikedKeys.value
+    val gate = visibilityGate() // R413：屏蔽频道/不感兴趣/关键词屏蔽同一谓词
     // 永久屏蔽（内容指纹）：可见性口径与主 Feed 一致，置顶区也不放行
     val permBlockedKeys = _blockedItems.value.mapTo(HashSet()) { it.key }
     val permBlockedUids = _blockedItems.value.mapNotNullTo(HashSet()) { b ->
@@ -626,7 +625,7 @@ internal suspend fun FeedViewModel.scanFreshSubscriptionItemsImpl(): List<VideoI
             // 已看过（R337 双轨判定收口 SeenDedupPolicy.isSeen：key 精确命中，或
             // 内容指纹命中=同片跨频道转发，换台不算"新"）
             if (SeenDedupPolicy.isSeen(item, seenKeys, seenUids)) continue
-            if (item.chatId in blocked || item.key in disliked) continue // 可见性口径对齐主 Feed
+            if (!gate.passes(item)) continue // 可见性口径对齐主 Feed（R413 VisibilityGate 含关键词屏蔽）
             // 永久屏蔽：key 命中或内容指纹命中都跳过（跨频道转发的同片也不置顶）
             if (SeenDedupPolicy.isSeen(item, permBlockedKeys, permBlockedUids)) continue
             // 单类型 tab 类型对齐（与 loadMore 的 pass 谓词同口径：tab != -1 时严格相等）

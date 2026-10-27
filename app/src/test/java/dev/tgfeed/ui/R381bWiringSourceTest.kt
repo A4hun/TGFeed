@@ -394,10 +394,12 @@ class R381bWiringSourceTest {
             chs.contains("private fun archaeoEraColor(yearsAgo: Double): Color"),
         )
         val tms = tms()
+        // R416 起 ChronicleRhythmFlowCanvas 可见性 private→internal（StarChronicleDossier
+        // 六卷卷宗跨文件消费位——非自造色源判词不受可见性影响）
         for (sig in listOf(
             "private fun ChronicleVolumeHeader(",
             "private fun VolumeFold(",
-            "private fun ChronicleRhythmFlowCanvas(",
+            "internal fun ChronicleRhythmFlowCanvas(",
         )) {
             val body = funBody(tms, sig)
             assertTrue(

@@ -26,9 +26,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
-class App : Application() {
+class App : Application(), androidx.work.Configuration.Provider {
     lateinit var container: AppContainer
         private set
+
+    // R432 启动性能：WorkManager 按需初始化（Manifest 已移除 androidx.startup 的
+    // WorkManagerInitializer，主线程不再预建 WM 内部 Room 库）。默认配置与被移除的
+    // 默认初始化器完全一致；唯一消费方 BackgroundSyncScheduler 在旁路线程首次
+    // getInstance 时才触发懒初始化。
+    override val workManagerConfiguration: androidx.work.Configuration by lazy {
+        androidx.work.Configuration.Builder().build()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -47,6 +55,7 @@ class App : Application() {
         dev.tgfeed.core.diag.ColdStartProbe.mark("App.onCreate 进程创建")
         container = AppContainer(this)
         dev.tgfeed.core.diag.ColdStartProbe.mark("App 容器就绪")
+        Thread { runCatching { dev.tgfeed.core.sync.BackgroundSyncScheduler.apply(this, container.prefs.backgroundSyncMinutes) } }.start() // R420 后台定时同步注册（旁路线程，不挡首帧）
     }
 
     /**
@@ -222,6 +231,13 @@ class AppContainer(private val context: Application) {
      * 本信号是"页面不在台前"（导航暂停的触发面），两者语义正交。
      */
     val feedPageActive = mutableStateOf(true)
+
+    /**
+     * R417 播放占有权：当前前台持有视频播放的路由（MainActivity 经
+     * resolvePlaybackOwner 纯函数写入；feedPageActive == (本值 == FEED) 同源派生）。
+     * 消费方：各视频池宿主的 PlaybackOwnershipGate。
+     */
+    val playbackOwner = mutableStateOf(dev.tgfeed.core.playback.PlaybackOwner.FEED)
 
     /**
      * R180 共享音频播放器（进程级持有；原为 FeedScreen remember 级）。
@@ -553,6 +569,30 @@ class AppContainer(private val context: Application) {
 
     fun openPlaylists() { _showPlaylists.value = true }
     fun closePlaylists() { _showPlaylists.value = false }
+
+    /**
+     * R387 播放队列（节目单）页显隐（镜像 showPlaylists 模式：状态驱动路由、
+     * 不进返回栈；入口=我的页「播放队列」行——播放列表旁，同为"我攒的单"语义组）。
+     * R391 起=单台编辑页（QueueScreen 编辑活跃台），宿主=播放台列表页
+     * [showQueueStations]（嵌套覆盖：编辑页返回=剥落回台列表）。
+     */
+    private val _showPlayQueue = MutableStateFlow(false)
+    val showPlayQueue: StateFlow<Boolean> = _showPlayQueue
+
+    fun openPlayQueue() { _showPlayQueue.value = true }
+    fun closePlayQueue() { _showPlayQueue.value = false }
+
+    /**
+     * R391 播放台列表页显隐（多队列管理面+今日台入口；镜像 showPlayQueue 模式）。
+     * 入口=我的页「播放台」行（一期「播放队列」行的二期升级位）；台卡编辑钮
+     * →openPlayQueue（showPlayQueue 分支排在 when 链更前=编辑页压在台列表上，
+     * MainActivity 分支序判词见 L1928 附近注释）。
+     */
+    private val _showQueueStations = MutableStateFlow(false)
+    val showQueueStations: StateFlow<Boolean> = _showQueueStations
+
+    fun openQueueStations() { _showQueueStations.value = true }
+    fun closeQueueStations() { _showQueueStations.value = false }
 
     /**
      * R177 顶层页滚页请求（一次性，nonce 单调递增）：路由侧（底栏点按/返回键回首页/

@@ -14,7 +14,7 @@ import java.io.File
  *    首保/空入/无上限口径）；
  *  - 上限口径：[GRID_SEED_FETCH_MAX]=48（对齐 GridScreen 画布记忆口径
  *    GRID_CANVAS_MAX_SLOTS——合集现拉路的唯一网络成本上限）；
- *  - wiring 源码锚（R3xxWiringSourceTest 同款 user.dir 源定位）：五入口「分屏播放」
+ *  - wiring 源码锚（R3xxWiringSourceTest 同款 user.dir 源定位）：六入口「分屏播放」
  *    字面量 + 统一机制容器口 + 探针计数行格式 + GridScreen 零刀（播放本体零碰红线）。
  */
 class R397GridSeedTest {
@@ -147,6 +147,18 @@ class R397GridSeedTest {
     }
 
     @Test
+    fun `入口五_台卡行尾与队列编辑面钮`() {
+        assertEntryButton("dev/tgfeed/ui/QueueStationsScreen.kt", "\$seedCount")
+        assertEntryButton("dev/tgfeed/ui/QueueScreen.kt", "\${seedable.size}")
+        // 频道条目归开台链判词：种子集=非跳过 Item 条目
+        val stations = src("dev/tgfeed/ui/QueueStationsScreen.kt")
+        assertTrue(
+            "台卡种子集=非跳过 Item 条目（频道条目不入格判词）",
+            stations.contains("filterIsInstance<PlayQueueEntry.Item>()"),
+        )
+    }
+
+    @Test
     fun `入口六_话题标签页钮`() {
         assertEntryButton("dev/tgfeed/ui/HashtagTimelineScreen.kt", "\${wall.size}")
     }
@@ -163,10 +175,10 @@ class R397GridSeedTest {
     }
 
     @Test
-    fun `宿主收口单口与四个来源标签`() {
+    fun `宿主收口单口与六个来源标签`() {
         val main = src("dev/tgfeed/MainActivity.kt")
         assertTrue("宿主收口单口必须在场", main.contains("private fun seedGridAndOpen("))
-        for (label in listOf("搜索", "收藏", "频道主页", "话题")) {
+        for (label in listOf("搜索", "收藏", "频道主页", "播放台", "队列", "话题")) {
             assertTrue("MainActivity 来源标签「$label」必须接线", main.contains("seedGridAndOpen(\"$label\""))
         }
         // 合集来源的宿主收口在 FeedScreen（CollectionsDialog 的宿主）

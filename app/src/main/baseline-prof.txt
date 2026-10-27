@@ -1,0 +1,10 @@
+HSPLdev/tgfeed/**->**(**)**
+Ldev/tgfeed/**;
+HSPLandroidx/compose/runtime/**->**(**)**
+Landroidx/compose/runtime/**;
+HSPLandroidx/compose/ui/**->**(**)**
+Landroidx/compose/ui/**;
+HSPLandroidx/compose/foundation/**->**(**)**
+Landroidx/compose/foundation/**;
+HSPLkotlinx/coroutines/**->**(**)**
+Lkotlinx/coroutines/**;

@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -36,6 +37,9 @@ import java.util.concurrent.atomic.AtomicInteger
 
 private const val TAG = "R229Pursue"
 
+/** R418 纯计数探针标签（只输出条数/耗时，零内容） */
+private const val PROBE = "R418Timeline"
+
 /**
  * R239 时间线 VM（首页一等 tab 的数据中枢；R229 v1 卡流三腿架构重构为扁平
  * 完整流四腿——用户修正①②③，设计定稿见 r239_notes D2~D4）。
@@ -45,13 +49,13 @@ private const val TAG = "R229Pursue"
  * PursueScreen 注入**共享 FeedViewModel 的深索引实例**（同 key 取出——写回
  * 走同一把 writeLock 与爬虫串行，见 DeepSearchIndex.ingestBrowsedPage）。
  *
- * 数据模型：`List<VideoItem>` 扁平完整流，dateEpochSec 升序（index 0=最旧、
+ * 数据模型：`List<VideoItem>` 扁平完整流，发布时间严格升序（R418b 撤回倒序：index 0=最旧，
  * 末尾=最新——「最新在最下面」用户拍板不变量延续；无每频道上限——时间窗内
  * 符合条件的都展示）。
  *
  * 四腿编排：
  *  1. **快车道（Read-Through Cache 读侧）**：进 tab 首拉先查深索引
- *     [DeepSearchIndex.timeWindowItems]（72h 窗、已加入频道集、索引倒序毫秒级）
+ *     [DeepSearchIndex.timeWindowItems]（72h 窗、已加入频道集、索引按时间倒查毫秒级）
  *     ——用户看过/爬过的时段零 API 直出（网络腿渐进补足其余）。
  *  2. **正路（全频道渐进 bootstrap）**：[pursueRecentChatIds]（id-only 枚举
  *     TTL 5min≈150ms，全量 598 频道——R229 的 24 上限撤销）→ 并发 5 路
@@ -64,7 +68,7 @@ private const val TAG = "R229Pursue"
  *     逐条**即时插入**流尾（0 延迟上屏——用户修正③；30s tick 不再延迟上屏，
  *     只做滚动窗修剪+新鲜期检查）。新内容计数供 UI「N 条新内容」胶囊
  *     （用户不在底部时安静排队）。
- *  4. **历史轮（无限回看）**：UI 滑到流顶触发 [requestHistoryRound]——全部
+ *  4. **历史轮（无限回看）**：UI 滑近流顶（最旧端）预取 [requestHistoryRound]——全部
  *     未到底频道并发 5 路 [pursueChannelHistoryPage]（每频道游标推进 1 页、
  *     maxRounds=1）→ 全局时间归并（先出先显）；**写回缓存**（Read-Through
  *     Cache 写侧）：每频道页结果经 [DeepSearchIndex.ingestBrowsedPage] 进
@@ -82,12 +86,22 @@ private const val TAG = "R229Pursue"
 internal class PursueViewModel(
     private val gateway: TdGateway,
     private val deepIndex: DeepSearchIndex?,
+    /** R418 可见性谓词源（共享 FeedViewModel.visibilityGate()；每次合并现取——屏蔽即时生效；null=不过滤） */
+    private val visibility: () -> VisibilityGate? = { null },
 ) : ViewModel() {
 
     private val _items = MutableStateFlow<List<VideoItem>>(emptyList())
 
-    /** 扁平完整流（**最新在最下面**——dateEpochSec 升序，index 0=最旧） */
+    /** 扁平完整流（发布时间严格升序——last=最新，见 [PURSUE_TIMELINE_ORDER]） */
     val items: StateFlow<List<VideoItem>> = _items.asStateFlow()
+
+    private val _cards = MutableStateFlow<List<PursueTimelineCard>>(emptyList())
+
+    /**
+     * R418b 卡片流（升序，最新卡在底）：在归并协程（IO 线程）里随流一起算好再发布——
+     * 主线程组合期不再全量分卡；尾追加时只重算末卡起的增量（[pursueTimelineCardsIncremental]）。
+     */
+    val cards: StateFlow<List<PursueTimelineCard>> = _cards.asStateFlow()
 
     private val _loading = MutableStateFlow(false)
 
@@ -116,7 +130,7 @@ internal class PursueViewModel(
 
     private val _newBelow = MutableStateFlow(0)
 
-    /** 实时推入但用户未读的新内容数（底部胶囊「N 条新内容」；用户回底部清零） */
+    /** 追加到底但用户未读的新内容数（底部胶囊「N 条新内容」；用户回到底部清零） */
     val newBelow: StateFlow<Int> = _newBelow.asStateFlow()
 
     private val _recentLiveKeys = MutableStateFlow<Set<String>>(emptySet())
@@ -144,6 +158,9 @@ internal class PursueViewModel(
     @Volatile
     private var active = false
 
+    /** R418b 激活信号（轮询循环离场挂起、进场即醒） */
+    private val activeSignal = MutableStateFlow(false)
+
     @Volatile
     private var bootstrappedAtMs = 0L
 
@@ -151,9 +168,31 @@ internal class PursueViewModel(
     @Volatile
     private var sweepInFlight = false
 
-    /** 用户是否在流底部（胶囊计数/清零的判据；UI 上报） */
+    /** 用户是否在流底部（底=最新端；胶囊计数/清零与自动跟随的判据；UI 上报） */
     @Volatile
     private var userAtBottom = true
+
+    /** R418b 探针：进页时刻（首屏毫秒起点；0=已报过首屏） */
+    @Volatile
+    private var enterAtMs = 0L
+
+    /** R418b 探针：待上屏的实时批（收到时刻毫秒、批大小、批内最旧发布秒）；UI 渲染后回报清空 */
+    @Volatile
+    private var pendingPush: Triple<Long, Int, Long>? = null
+
+    /** R418b 实时推入通道：事件不在收集协程里逐条归并，coalesce 成批（零时间窗——有多少取多少） */
+    private val liveCh = Channel<Pair<VideoItem, Long>>(capacity = Channel.UNLIMITED)
+
+    /** R418b 实时新帖入索引通道：与上屏链路解耦（索引写锁与爬虫共用，曾串行阻塞下一条事件上屏） */
+    private val ingestCh = Channel<VideoItem>(capacity = Channel.UNLIMITED)
+
+    /** R418 索引分页游标（已交付的最旧位置；null=未起步，从流最旧端起） */
+    @Volatile
+    private var indexCursor: PursueCursor? = null
+
+    /** R418 本地快照已出过（秒开只做一次；补新在后台照常） */
+    @Volatile
+    private var localSnapshotDone = false
 
     /** 轮询循环只起一次（VM 生命周期内常驻，active 门控节拍） */
     private var loopStarted = false
@@ -176,6 +215,8 @@ internal class PursueViewModel(
             }
         }
         // 实时推入（真网关；Mock 无更新流——bootstrap 假数据自洽）
+        // R418b 推送链路：收集协程只入通道（零阻塞）；独立归并协程把积压事件一次取空成批
+        // 归并（无时间窗，事件多时自然合批、少时逐条即上）；入索引走另一条通道不挡上屏。
         val lib = gateway as? TdLibGateway
         if (lib != null) {
             viewModelScope.launch(Dispatchers.IO) {
@@ -183,15 +224,33 @@ internal class PursueViewModel(
                     .getOrDefault(MutableSharedFlow<VideoItem>()) // 空流兜底：订阅失败静默
                     .collect { item ->
                         if (item.chatId < 0L && item.dateEpochSec > 0) {
-                            runCatching { mergeIntoStream(listOf(item), live = true) }
-                                .onFailure { Log.w(TAG, "时间线实时推入失败（跳过）: ${it.message}") }
-                            // R286 新帖快通道：实时推入的新帖顺手入索引——「刚发的」
-                            // 秒级可搜（幂等管道+日软顶，失败静默绝不影响主链路）
-                            deepIndex?.let { idx ->
-                                runCatching { idx.ingestBrowsedPages(listOf(item)) }
-                            }
+                            liveCh.trySend(item to System.currentTimeMillis())
                         }
                     }
+            }
+            viewModelScope.launch(Dispatchers.Default) {
+                for (first in liveCh) {
+                    val batch = ArrayList<VideoItem>(8)
+                    var firstAt = first.second
+                    batch += first.first
+                    while (true) {
+                        val more = liveCh.tryReceive().getOrNull() ?: break
+                        batch += more.first
+                        firstAt = minOf(firstAt, more.second)
+                    }
+                    runCatching { mergeIntoStream(batch, live = true, liveAtMs = firstAt) }
+                        .onFailure { Log.w(TAG, "时间线实时推入失败（跳过）: ${it.message}") }
+                    for (it in batch) ingestCh.trySend(it)
+                }
+            }
+            // R286 新帖快通道：实时推入的新帖顺手入索引——「刚发的」秒级可搜
+            // （幂等管道+日软顶，失败静默绝不影响主链路）
+            viewModelScope.launch(Dispatchers.IO) {
+                for (first in ingestCh) {
+                    val batch = arrayListOf(first)
+                    while (true) batch += ingestCh.tryReceive().getOrNull() ?: break
+                    deepIndex?.let { idx -> runCatching { idx.ingestBrowsedPages(batch) } }
+                }
             }
         }
     }
@@ -203,10 +262,44 @@ internal class PursueViewModel(
      */
     fun setActive(a: Boolean) {
         active = a
-        if (a) ensureLoop()
+        activeSignal.value = a
+        if (a) {
+            if (_cards.value.isEmpty()) enterAtMs = System.currentTimeMillis()
+            showLocalSnapshot()
+            ensureLoop()
+        }
     }
 
-    /** UI 上报用户是否在流底部（胶囊清零判据——回底部=新内容已见） */
+    /**
+     * R418 本地秒开：进页即读深索引 3 天窗快照（零 API、**不等风暴闸**——纯本地读，
+     * 首屏不该被开机窗卡住），合并上屏；网络补新由轮询循环后台跟进。只做一次。
+     * 频道过滤：已枚举过频道全集用全集；未枚举（首进）不限频道（索引只收录已加入频道）。
+     */
+    private fun showLocalSnapshot() {
+        if (localSnapshotDone || deepIndex == null) return
+        localSnapshotDone = true
+        viewModelScope.launch(Dispatchers.IO) {
+            val t0 = System.currentTimeMillis()
+            val nowSec = t0 / 1000L
+            val hits = runCatching {
+                deepIndex.timeWindowItems(
+                    TimeWindowQuery(
+                        fromSec = nowSec - PURSUE_TIMELINE_WINDOW_SEC,
+                        toSec = nowSec,
+                        channelIds = joinedChatIds.takeIf { it.isNotEmpty() }?.toSet(),
+                        limit = TimeWindowPolicy.QUERY_LIMIT_MAX,
+                    ),
+                )
+            }.getOrDefault(emptyList())
+            if (hits.isNotEmpty()) {
+                mergeIntoStream(hits, live = false)
+                _bootstrapped.value = true
+            }
+            Log.i(PROBE, "本地快照 命中=${hits.size} 流=${_items.value.size} 耗时=${System.currentTimeMillis() - t0}ms")
+        }
+    }
+
+    /** UI 上报用户是否在流底部（底=最新端；胶囊清零判据——回到底部=新内容已见） */
     fun setUserAtBottom(atBottom: Boolean) {
         userAtBottom = atBottom
         if (atBottom) _newBelow.value = 0
@@ -215,6 +308,23 @@ internal class PursueViewModel(
     /** 胶囊点按：清零计数（滚动到底由 UI 执行） */
     fun consumeNewBelow() {
         _newBelow.value = 0
+    }
+
+    /**
+     * R418b 探针回报（UI 在卡片流发布后的首帧回调）：首屏=进页到首屏出卡毫秒+卡数/条数；
+     * 推送=最早事件收到时刻到上屏毫秒+批大小+发布时刻到上屏秒差。纯计数+耗时。
+     */
+    fun reportRendered(cardCount: Int) {
+        val now = System.currentTimeMillis()
+        val enter = enterAtMs
+        if (enter > 0L && cardCount > 0) {
+            enterAtMs = 0L
+            Log.i(PROBE, "首屏 卡=${cardCount} 条=${_items.value.size} 耗时=${now - enter}ms")
+        }
+        pendingPush?.let { (at, n, pubSec) ->
+            pendingPush = null
+            Log.i(PROBE, "推送 批=${n} 事件到上屏=${now - at}ms 发布到上屏=${now / 1000L - pubSec}s")
+        }
     }
 
     /** 双击刷新令（timelineRefreshRequest nonce 消费）：强刷=绕过新鲜期立刻重扫 */
@@ -227,7 +337,7 @@ internal class PursueViewModel(
     }
 
     /**
-     * 历史轮入口（UI 滑到流顶触发）：全频道游标推进一轮+写回索引+网络空手时
+     * 历史轮入口（UI 滑近流顶=最旧端时预取）：全频道游标推进一轮+写回索引+网络空手时
      * 索引 fallback。幂等闸：在飞/终态/bootstrap 在飞时静默跳过。
      */
     fun requestHistoryRound() {
@@ -248,7 +358,8 @@ internal class PursueViewModel(
                 .onFailure { Log.w(TAG, "时间线风暴闸等待异常（按放行处理）: ${it.message}") }
             while (true) {
                 if (!active) {
-                    delay(400)
+                    // R418b：离场挂起等激活信号（原 400ms 轮询空转=重进页补拉最多晚 400ms）
+                    activeSignal.first { it }
                     continue
                 }
                 if (bootstrappedAtMs == 0L ||
@@ -273,8 +384,8 @@ internal class PursueViewModel(
             val old = _items.value
             val nowSec = System.currentTimeMillis() / 1000L
             val cutoff = pursueTimelineCutoffSec(nowSec, PURSUE_TIMELINE_WINDOW_SEC, historyFloorSec)
-            val merged = pursueTimelineMerge(old, emptyList(), cutoff)
-            if (merged != old) _items.value = merged
+            val merged = pursueTimelineMerge(old, emptyList(), cutoff, keep = keepPredicate())
+            if (merged != old) publish(old, merged)
         }
         if (_recentLiveKeys.value.isNotEmpty()) {
             // 标记只服务「新格首次组合」：30s 后新到格已组合完毕，标记退役
@@ -288,40 +399,57 @@ internal class PursueViewModel(
      * 与实时 collector 都走这里，[streamLock] 串行）：去重来者覆盖（富字段版本
      * 胜）→ cutoff 过滤 → 升序 → 硬顶裁旧。live=true 时做新内容计数+滑入标记。
      */
-    private suspend fun mergeIntoStream(incoming: List<VideoItem>, live: Boolean) {
+    private suspend fun mergeIntoStream(
+        incoming: List<VideoItem>,
+        live: Boolean,
+        history: Boolean = false,
+        liveAtMs: Long = 0L,
+    ) {
         if (incoming.isEmpty()) return
         streamLock.withLock {
+            val t0 = System.currentTimeMillis()
             val old = _items.value
-            val nowSec = System.currentTimeMillis() / 1000L
+            val nowSec = t0 / 1000L
+            // R418：历史产物先下移地板再算 cutoff（旧实现后推进=窗下历史当场被裁）
+            historyFloorSec = pursueHistoryFloorAfter(
+                historyFloorSec, incoming, nowSec, PURSUE_TIMELINE_WINDOW_SEC, history,
+            )
             val cutoff = pursueTimelineCutoffSec(nowSec, PURSUE_TIMELINE_WINDOW_SEC, historyFloorSec)
-            val merged = pursueTimelineMerge(old, incoming, cutoff)
-            _items.value = merged
+            val merged = pursueTimelineMerge(old, incoming, cutoff, keep = keepPredicate())
+            val added = pursueTimelineNewerCount(old, merged)
             if (live) {
-                val added = pursueTimelineAppendCount(old, merged)
-                if (added > 0 && !userAtBottom) _newBelow.value += added
-                if (incoming.isNotEmpty()) {
-                    val keys = _recentLiveKeys.value + incoming.mapTo(HashSet(incoming.size)) { it.key }
-                    _recentLiveKeys.value = if (keys.size > 256) {
-                        keys.drop(keys.size - 256).toSet()
-                    } else {
-                        keys
-                    }
-                }
-                if (added > 0) {
-                    Log.i(TAG, "时间线实时推入：+${added} 新内容（未读=${_newBelow.value} 流=${merged.size}）")
-                }
-            }
-            // 历史层底推进（流最旧端变旧=用户翻过更早——修剪地板随行）：
-            // 首次出现窗下内容（历史轮产物）即立地板；此后单调取更旧。
-            val oldest = merged.firstOrNull()?.dateEpochSec?.toLong() ?: 0L
-            if (oldest > 0L) {
-                historyFloorSec = if (historyFloorSec <= 0L) {
-                    if (oldest < nowSec - PURSUE_TIMELINE_WINDOW_SEC) oldest else historyFloorSec
+                val keys = _recentLiveKeys.value + incoming.mapTo(HashSet(incoming.size)) { it.key }
+                _recentLiveKeys.value = if (keys.size > 256) {
+                    keys.drop(keys.size - 256).toSet()
                 } else {
-                    minOf(historyFloorSec, oldest)
+                    keys
+                }
+                if (liveAtMs > 0L && added > 0) {
+                    val pub = incoming.minOf { it.dateEpochSec.toLong() }
+                    pendingPush = Triple(liveAtMs, incoming.size, pub)
                 }
             }
+            publish(old, merged)
+            if (added > 0 && !userAtBottom) _newBelow.value += added
+            Log.i(
+                PROBE,
+                "合并 入=${incoming.size} 旧=${old.size} 新=${merged.size} 追底=$added " +
+                    "未读=${_newBelow.value} live=$live 历史=$history 耗时=${System.currentTimeMillis() - t0}ms",
+            )
         }
+    }
+
+    /** R418b 发布流+卡片（分卡在调用方的后台线程完成，尾追加走增量；须在 [streamLock] 内调用） */
+    private fun publish(old: List<VideoItem>, merged: List<VideoItem>) {
+        val cards = pursueTimelineCardsIncremental(old, _cards.value, merged)
+        _items.value = merged
+        _cards.value = cards
+    }
+
+    /** R418 可见性谓词（共享 VisibilityGate 现取；不可得=全放行） */
+    private fun keepPredicate(): (VideoItem) -> Boolean {
+        val gate = runCatching { visibility() }.getOrNull() ?: return { true }
+        return gate::passes
     }
 
     /**
@@ -406,10 +534,11 @@ internal class PursueViewModel(
                     }
                     .flatten()
                 val nowSec = System.currentTimeMillis() / 1000L
-                _items.value = pursueTimelineMerge(
+                val mock = pursueTimelineMerge(
                     emptyList(), mockItems,
                     pursueTimelineCutoffSec(nowSec, PURSUE_TIMELINE_WINDOW_SEC, 0L),
                 )
+                streamLock.withLock { publish(_items.value, mock) }
                 _bootstrapped.value = true
             }
             bootstrappedAtMs = System.currentTimeMillis()
@@ -459,7 +588,7 @@ internal class PursueViewModel(
                                 deepIndex?.let { idx ->
                                     runCatching { idx.ingestBrowsedPage(chatId, page.items) }
                                 }
-                                mergeCh.trySend(page.items)
+                                mergeIntoStream(page.items, live = false, history = true)
                             }
                         }
                     }
@@ -480,9 +609,10 @@ internal class PursueViewModel(
     }
 
     /**
-     * 深索引 fallback（用户修正②的 c 腿）：从当前流最旧端向下按
-     * [PURSUE_INDEX_FALLBACK_STEP_SEC] 逐窗找本地内容（至多
-     * [PURSUE_INDEX_FALLBACK_MAX_WINDOWS] 窗防长空转）；找到即归并（零 API）；
+     * 深索引游标分页（用户修正②的 c 腿；R418 改元组游标）：从 [indexCursor]（缺省=
+     * 当前流最旧条目）向下按 [PURSUE_INDEX_FALLBACK_STEP_SEC] 逐窗取本地内容
+     * （至多 [PURSUE_INDEX_FALLBACK_MAX_WINDOWS] 窗防长空转）；窗含游标秒、同秒按
+     * (chatId,messageId) 严格过滤——不重；满页按边界秒整取——不漏（[pursueIndexStep]）。
      * 找不到且索引量程也无更早 → 诚实终态（historyExhausted=true）。
      */
     private suspend fun tryIndexFallbackOrExhaust() {
@@ -490,53 +620,66 @@ internal class PursueViewModel(
             _historyExhausted.value = true
             return
         }
-        val oldest = streamLock.withLock { _items.value.firstOrNull()?.dateEpochSec?.toLong() ?: 0L }
-        if (oldest <= 0L) {
+        val t0 = System.currentTimeMillis()
+        val streamOldest = streamLock.withLock { _items.value.firstOrNull() } // 升序：头=最旧
+        val prev = indexCursor
+        var cursor = when {
+            streamOldest == null -> prev
+            prev == null -> pursueCursorOf(streamOldest)
+            // 网络历史轮可能已把流推得比索引游标更旧：取更旧者
+            pursueOlderThan(streamOldest, prev) -> pursueCursorOf(streamOldest)
+            else -> prev
+        }
+        if (cursor == null || cursor.dateSec <= 0L) {
             _historyExhausted.value = true
             return
         }
-        var floor = oldest
-        var found = false
+        var delivered = 0
         var probed = 0
-        while (!found && probed < PURSUE_INDEX_FALLBACK_MAX_WINDOWS) {
-            val w = pursueHistoryFallbackWindow(floor, PURSUE_INDEX_FALLBACK_STEP_SEC) ?: break
+        while (delivered == 0 && probed < PURSUE_INDEX_FALLBACK_MAX_WINDOWS) {
+            val w = pursueIndexWindow(cursor!!, PURSUE_INDEX_FALLBACK_STEP_SEC) ?: break
+            val limit = TimeWindowPolicy.QUERY_LIMIT_MAX
             val hits = withContext(Dispatchers.IO) {
                 runCatching {
                     idx.timeWindowItems(
                         TimeWindowQuery(
                             fromSec = w.first,
                             toSec = w.second,
-                            channelIds = joinedChatIds.toSet(),
-                            limit = TimeWindowPolicy.QUERY_LIMIT_MAX,
+                            channelIds = joinedChatIds.takeIf { it.isNotEmpty() }?.toSet(),
+                            limit = limit,
                         ),
                     )
                 }.getOrDefault(emptyList())
             }
-            if (hits.isNotEmpty()) {
-                mergeIntoStream(hits, live = false)
-                found = true
-                Log.i(TAG, "时间线索引 fallback：本地窗命中 ${hits.size} 条（零 API）")
-                break
+            val step = pursueIndexStep(cursor, hits, w.first, limit)
+            cursor = step.next
+            if (step.items.isNotEmpty()) {
+                mergeIntoStream(step.items, live = false, history = true)
+                delivered = step.items.size
             }
-            floor = w.first
             probed++
         }
-        if (!found) {
-            // 索引也无更早：量程判定（dateBounds 最旧端仍在当前最旧之下=索引还有
+        indexCursor = cursor
+        Log.i(PROBE, "索引分页 交付=$delivered 探窗=$probed 耗时=${System.currentTimeMillis() - t0}ms")
+        if (delivered == 0) {
+            // 索引也无更早：量程判定（dateBounds 最旧端仍在游标之下=索引还有
             // 没探到的更早窗——保持可重试；量程以内无更早=真终态）
+            val floor = cursor?.dateSec ?: 0L
             val bounds = withContext(Dispatchers.IO) {
                 runCatching { idx.dateBounds() }.getOrNull()
             }
             val indexOldest = bounds?.first ?: 0L
-            _historyExhausted.value = indexOldest <= 0L || indexOldest >= floor - PURSUE_INDEX_FALLBACK_STEP_SEC
+            _historyExhausted.value = indexOldest <= 0L || indexOldest >= floor
             if (_historyExhausted.value) {
-                Log.i(TAG, "时间线历史终态：游标/索引双到底（索引最旧=$indexOldest 流最旧=$floor）")
+                Log.i(TAG, "时间线历史终态：游标/索引双到底")
             }
         }
     }
 
     override fun onCleared() {
         mergeCh.close()
+        liveCh.close()
+        ingestCh.close()
         super.onCleared()
     }
 
@@ -552,8 +695,9 @@ internal class PursueViewModel(
 internal class PursueViewModelFactory(
     private val gateway: TdGateway,
     private val deepIndex: DeepSearchIndex?,
+    private val visibility: () -> VisibilityGate? = { null },
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T =
-        PursueViewModel(gateway, deepIndex) as T
+        PursueViewModel(gateway, deepIndex, visibility) as T
 }

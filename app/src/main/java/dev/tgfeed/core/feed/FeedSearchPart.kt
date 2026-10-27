@@ -314,26 +314,33 @@ internal fun FeedViewModel.liveAskSearchImpl(query: String) {
                 .filter { !answerItemCache.containsKey(it) && it !in answerResolveDead && answerResolveInFlight.add(it) }
             if (pending.isEmpty()) return
             viewModelScope.launch(Dispatchers.IO) {
-                try {
-                    val resolved = real.resolveLiveAnswerItems(pending)
-                    if (resolved != null) {
-                        for ((link, item) in resolved) {
-                            answerItemCache[link] = item
-                            // 解析成功顺手沉淀：link→chatId 回填（用户名链接标题行升级用）
-                            // + 频道标题写图谱（下轮同频道答案直接带标题，不再挂"识别中…"）
-                            answerLinkChatCache[link] = item.chatId
-                            if (item.channelTitle.isNotBlank()) {
-                                runCatching { real.discoveryGraph.recordNodeTitle(item.chatId, item.channelTitle) }
+                // R429：fire-and-forget 协程不再裸奔——网关侧异常（含授权超时）穿透会崩进程；
+                // runCatching 兜底收场，CancellationException（真取消）必须原样上抛不吞
+                runCatching {
+                    try {
+                        val resolved = real.resolveLiveAnswerItems(pending)
+                        if (resolved != null) {
+                            for ((link, item) in resolved) {
+                                answerItemCache[link] = item
+                                // 解析成功顺手沉淀：link→chatId 回填（用户名链接标题行升级用）
+                                // + 频道标题写图谱（下轮同频道答案直接带标题，不再挂"识别中…"）
+                                answerLinkChatCache[link] = item.chatId
+                                if (item.channelTitle.isNotBlank()) {
+                                    runCatching { real.discoveryGraph.recordNodeTitle(item.chatId, item.channelTitle) }
+                                }
                             }
+                            val okLinks = resolved.mapTo(HashSet()) { it.first }
+                            for (link in pending) if (link !in okLinks) answerResolveDead += link // 死信不再重试
                         }
-                        val okLinks = resolved.mapTo(HashSet()) { it.first }
-                        for (link in pending) if (link !in okLinks) answerResolveDead += link // 死信不再重试
+                    } finally {
+                        answerResolveInFlight.removeAll(pending.toSet())
                     }
-                } finally {
-                    answerResolveInFlight.removeAll(pending.toSet())
-                }
-                if (myGen == liveAskGen) {
-                    publish(_liveAsk.value?.takeIf { it.query == q }?.asking ?: false)
+                    if (myGen == liveAskGen) {
+                        publish(_liveAsk.value?.takeIf { it.query == q }?.asking ?: false)
+                    }
+                }.onFailure {
+                    if (it is kotlinx.coroutines.CancellationException) throw it
+                    android.util.Log.w("FeedViewModel", "kickLiveResolve: 解析协程异常收场（不崩进程）：${it.message}")
                 }
             }
         }
@@ -349,53 +356,60 @@ internal fun FeedViewModel.liveAskSearchImpl(query: String) {
             }.map { it.answer }
             if (pendingAns.isEmpty()) return
             viewModelScope.launch(Dispatchers.IO) {
-                val outcome = real.resolveAnswerTitles(pendingAns.map { it.username }, live = true)
-                if (outcome != null) {
-                    for (ans in pendingAns) {
-                        val hit = outcome.titles[ans.username.trim().removePrefix("@").lowercase()] ?: continue
-                        answerLinkChatCache[ans.link] = hit.first
+                // R429：fire-and-forget 裸奔修复（与 kickLiveResolve 同口径）——runCatching
+                // 兜底收场，CancellationException（真取消）必须原样上抛不吞
+                runCatching {
+                    val outcome = real.resolveAnswerTitles(pendingAns.map { it.username }, live = true)
+                    if (outcome != null) {
+                        for (ans in pendingAns) {
+                            val hit = outcome.titles[ans.username.trim().removePrefix("@").lowercase()] ?: continue
+                            answerLinkChatCache[ans.link] = hit.first
+                        }
+                        if (myGen == liveAskGen) {
+                            publish(_liveAsk.value?.takeIf { it.query == q }?.asking ?: false)
+                        }
                     }
-                    if (myGen == liveAskGen) {
-                        publish(_liveAsk.value?.takeIf { it.query == q }?.asking ?: false)
-                    }
-                }
-                // 网页泳道补标题（SearchPublicChat 账号级 429 封死时与 TDLib 完全隔离的 IP 泳道）：
-                // TDLib 泳道跑完后仍挂"识别中"的用户名走 t.me/s/ 预览页换真频道名，
-                // 成功回填答案库 hintTitle + 就地升级 byEntity 里的答案对象再重发行状态
-                val stNow = _liveAsk.value
-                if (stNow != null && stNow.query == q) {
-                    val remaining = stNow.links.filter { la ->
-                        la.item == null && la.answer.chatId == 0L &&
-                            la.answer.username.isNotBlank() && answerTitleOf(la.answer).isEmpty()
-                    }.map { it.answer }
-                    if (remaining.isNotEmpty()) {
-                        val webInfos = real.resolveTitlesViaWeb(remaining.map { it.username })
-                        if (webInfos.isNotEmpty()) {
-                            for (ans in remaining) {
-                                val info = webInfos[ans.username.trim().removePrefix("@").lowercase()] ?: continue
-                                // R48：标题与成员数（og:description 解析）一并回填答案库
-                                runCatching { real.groupHarvester.answerStore.backfillHintTitle(ans.link, info.title, info.members) }
-                            }
-                            // publish 从 byEntity 现重建行——必须把桶里的旧答案对象换成 hintTitle/members 升级版
-                            var touched = false
-                            for (id in order) {
-                                val bucket = byEntity[id] ?: continue
-                                val upgraded = bucket.first.map { (ans, fromTitle) ->
-                                    val info = webInfos[ans.username.trim().removePrefix("@").lowercase()]
-                                    val newTitle = if (ans.hintTitle.isBlank()) info?.title ?: ans.hintTitle else ans.hintTitle
-                                    val newMembers = if (ans.members <= 0) info?.members ?: ans.members else ans.members
-                                    if (newTitle != ans.hintTitle || newMembers != ans.members) {
-                                        touched = true
-                                        ans.copy(hintTitle = newTitle, members = newMembers) to fromTitle
-                                    } else ans to fromTitle
+                    // 网页泳道补标题（SearchPublicChat 账号级 429 封死时与 TDLib 完全隔离的 IP 泳道）：
+                    // TDLib 泳道跑完后仍挂"识别中"的用户名走 t.me/s/ 预览页换真频道名，
+                    // 成功回填答案库 hintTitle + 就地升级 byEntity 里的答案对象再重发行状态
+                    val stNow = _liveAsk.value
+                    if (stNow != null && stNow.query == q) {
+                        val remaining = stNow.links.filter { la ->
+                            la.item == null && la.answer.chatId == 0L &&
+                                la.answer.username.isNotBlank() && answerTitleOf(la.answer).isEmpty()
+                        }.map { it.answer }
+                        if (remaining.isNotEmpty()) {
+                            val webInfos = real.resolveTitlesViaWeb(remaining.map { it.username })
+                            if (webInfos.isNotEmpty()) {
+                                for (ans in remaining) {
+                                    val info = webInfos[ans.username.trim().removePrefix("@").lowercase()] ?: continue
+                                    // R48：标题与成员数（og:description 解析）一并回填答案库
+                                    runCatching { real.groupHarvester.answerStore.backfillHintTitle(ans.link, info.title, info.members) }
                                 }
-                                byEntity[id] = upgraded to bucket.second
-                            }
-                            if (touched && myGen == liveAskGen) {
-                                publish(_liveAsk.value?.takeIf { it.query == q }?.asking ?: false)
+                                // publish 从 byEntity 现重建行——必须把桶里的旧答案对象换成 hintTitle/members 升级版
+                                var touched = false
+                                for (id in order) {
+                                    val bucket = byEntity[id] ?: continue
+                                    val upgraded = bucket.first.map { (ans, fromTitle) ->
+                                        val info = webInfos[ans.username.trim().removePrefix("@").lowercase()]
+                                        val newTitle = if (ans.hintTitle.isBlank()) info?.title ?: ans.hintTitle else ans.hintTitle
+                                        val newMembers = if (ans.members <= 0) info?.members ?: ans.members else ans.members
+                                        if (newTitle != ans.hintTitle || newMembers != ans.members) {
+                                            touched = true
+                                            ans.copy(hintTitle = newTitle, members = newMembers) to fromTitle
+                                        } else ans to fromTitle
+                                    }
+                                    byEntity[id] = upgraded to bucket.second
+                                }
+                                if (touched && myGen == liveAskGen) {
+                                    publish(_liveAsk.value?.takeIf { it.query == q }?.asking ?: false)
+                                }
                             }
                         }
                     }
+                }.onFailure {
+                    if (it is kotlinx.coroutines.CancellationException) throw it
+                    android.util.Log.w("FeedViewModel", "kickLiveTitleResolve: 解析协程异常收场（不崩进程）：${it.message}")
                 }
             }
         }
@@ -453,68 +467,148 @@ internal fun FeedViewModel.kickGroupAnswerResolve(q: String) {
     // 不能挪进 launch 里读流：快速换词时新词覆盖旧值，旧词会白烧一词一轮闸却零解析
     val answers = _groupAnswers.value?.takeIf { it.first == q }?.second.orEmpty()
     viewModelScope.launch(Dispatchers.IO) {
-        // 链接形态分流（与秒回区同根修）：频道主页类裸链接恒被 GetMessageLinkInfo 拒，
-        // 不进解析窗/不染死信表，直接走下方 resolveAnswerTitles 的标题链出可点频道行
-        val links = answers.map { it.link }
-            .filter { dev.tgfeed.core.td.TdLibGateway.isMessageLevelLink(it) }
-            .take(TdLibGateway.ANSWER_INLINE_RESOLVE_MAX) // 分流后再取窗：频道链接不占内容卡名额
-            .filter { !answerItemCache.containsKey(it) && it !in answerResolveDead && answerResolveInFlight.add(it) }
-        if (links.isNotEmpty()) {
-            try {
-                val resolved = real.resolveGroupAnswerItems(links)
-                if (resolved != null) {
-                    for ((link, item) in resolved) {
-                        answerItemCache[link] = item
-                        // 解析成功顺手沉淀：link→chatId 回填（用户名链接标题行升级用）
-                        // + 频道标题写图谱（下轮同频道答案直接带标题，不再挂"识别中…"）
-                        answerLinkChatCache[link] = item.chatId
-                        if (item.channelTitle.isNotBlank()) {
-                            runCatching { real.discoveryGraph.recordNodeTitle(item.chatId, item.channelTitle) }
+        // R429：fire-and-forget 不再裸奔（与秒回区两处同口径）——网关侧异常（含授权超时）
+        // 穿透会崩进程；runCatching 兜底收场，CancellationException（真取消）必须原样上抛不吞
+        runCatching {
+            // 链接形态分流（与秒回区同根修）：频道主页类裸链接恒被 GetMessageLinkInfo 拒，
+            // 不进解析窗/不染死信表，直接走下方 resolveAnswerTitles 的标题链出可点频道行
+            val links = answers.map { it.link }
+                .filter { dev.tgfeed.core.td.TdLibGateway.isMessageLevelLink(it) }
+                .take(TdLibGateway.ANSWER_INLINE_RESOLVE_MAX) // 分流后再取窗：频道链接不占内容卡名额
+                .filter { !answerItemCache.containsKey(it) && it !in answerResolveDead && answerResolveInFlight.add(it) }
+            if (links.isNotEmpty()) {
+                try {
+                    val resolved = real.resolveGroupAnswerItems(links)
+                    if (resolved != null) {
+                        for ((link, item) in resolved) {
+                            answerItemCache[link] = item
+                            // 解析成功顺手沉淀：link→chatId 回填（用户名链接标题行升级用）
+                            // + 频道标题写图谱（下轮同频道答案直接带标题，不再挂"识别中…"）
+                            answerLinkChatCache[link] = item.chatId
+                            if (item.channelTitle.isNotBlank()) {
+                                runCatching { real.discoveryGraph.recordNodeTitle(item.chatId, item.channelTitle) }
+                            }
+                        }
+                        val okLinks = resolved.mapTo(HashSet()) { it.first }
+                        for (link in links) if (link !in okLinks) answerResolveDead += link
+                        android.util.Log.i(
+                            "FeedViewModel",
+                            "群友搜到过 eager 解析：「$q」请求 ${links.size} 条，解析出 ${resolved.size} 条",
+                        )
+                    } else {
+                        // 预算耗尽=本轮未尝试：放出一词一轮闸，下次搜同词可重试——
+                        // 否则闸已烧掉、解析又没发生，该词整会话恒挂"识别中…"（挂死根因之一）
+                        answerResolvedWords.remove(folded)
+                        android.util.Log.d("FeedViewModel", "群友搜到过 eager 解析：「$q」预算耗尽未尝试，放出词闸待重试")
+                    }
+                } finally {
+                    // 在飞集合必须在 finally 里清：旧版异常路径漏清，链接永久卡"在飞"
+                    // 不再重试也不进死信，对应行永远挂"识别中…"（挂死根因之一）
+                    answerResolveInFlight.removeAll(links.toSet())
+                }
+            }
+            // "识别中"标题行懒解析（投诉"一直显示识别中"的修复）：没出内容卡、chatId==0 的
+            // 用户名链接（频道主页类链接永远出不了内容卡，正确呈现是带真标题的频道行）——
+            // 小预算 SearchPublicChat 换真 chatId+标题，成功回填 answerLinkChatCache，
+            // publish 时 answerTitleOf 借它出真标题；预算耗尽（null）放词闸下轮重试
+            val pendingTitleAnswers = answers.filter { ans ->
+                ans.chatId == 0L && ans.username.isNotBlank() &&
+                    !answerItemCache.containsKey(ans.link) && answerTitleOf(ans).isEmpty()
+            }
+            if (pendingTitleAnswers.isNotEmpty()) {
+                val outcome = real.resolveAnswerTitles(pendingTitleAnswers.map { it.username }, live = false)
+                // 预算耗尽（null）或整批被 429 挤掉（hadFlood）：都放闸，下次搜同词重试——
+                // 闸已烧掉而解析没成功，该词整会话恒挂裸 @用户名（实证：搜索扇出并发期
+                // 历史区标题整批 0/12，是"答案区全是@id"投诉的主根因之一）
+                if (outcome == null || outcome.hadFlood) {
+                    answerResolvedWords.remove(folded)
+                    // 零网络标题回填（429 封死 SearchPublicChat 时的主链）：读答案来源会话的
+                    // 最近历史，从内联按钮配对"链接→标题"线索（GetChatHistory 是另一条 API
+                    // 泳道，实证不在 429 范围）——升级答案库空线索并即时重发行状态
+                    viewModelScope.launch(Dispatchers.IO) {
+                        val fromGroups = pendingTitleAnswers.map { it.fromGroup }.distinct()
+                        if (fromGroups.isNotEmpty()) {
+                            val hints = real.harvestAnswerTitleHints(fromGroups)
+                            var changed = false
+                            for ((link, hint) in hints) {
+                                // R48：标题与行尾成员数（实体/位置配对解析）一并回填答案库
+                                if (real.groupHarvester.answerStore.backfillHintTitle(link, hint.title, hint.members) > 0) changed = true
+                            }
+                            if (changed) {
+                                // 当前行持有的答案对象是旧快照：就地升级 hintTitle/members 后重发
+                                val cur = _groupAnswers.value
+                                if (cur != null && cur.first == q) {
+                                    _groupAnswers.value = q to cur.second.map { ans ->
+                                        val hint = hints[ans.link]
+                                        val newTitle = if (ans.hintTitle.isBlank()) hint?.title ?: ans.hintTitle else ans.hintTitle
+                                        val newMembers = if (ans.members <= 0) hint?.members ?: ans.members else ans.members
+                                        if (newTitle != ans.hintTitle || newMembers != ans.members) {
+                                            ans.copy(hintTitle = newTitle, members = newMembers)
+                                        } else ans
+                                    }
+                                }
+                                publishGroupAnswerRows(q)
+                            }
                         }
                     }
-                    val okLinks = resolved.mapTo(HashSet()) { it.first }
-                    for (link in links) if (link !in okLinks) answerResolveDead += link
-                    android.util.Log.i(
-                        "FeedViewModel",
-                        "群友搜到过 eager 解析：「$q」请求 ${links.size} 条，解析出 ${resolved.size} 条",
-                    )
-                } else {
-                    // 预算耗尽=本轮未尝试：放出一词一轮闸，下次搜同词可重试——
-                    // 否则闸已烧掉、解析又没发生，该词整会话恒挂"识别中…"（挂死根因之一）
-                    answerResolvedWords.remove(folded)
-                    android.util.Log.d("FeedViewModel", "群友搜到过 eager 解析：「$q」预算耗尽未尝试，放出词闸待重试")
+                    // 限流降级自动补踢（R44）：间隔吃服务端真实 retry-after（clamp 30s~2h）——
+                    // 短波峰很快补上，封号级长封禁按真实节奏慢踢不硬撞
+                    // （旧版 clamp 上限 600s：retry after 15000s 被压成每 10 分钟一批白撞墙）；
+                    // 词闸已放出故重踢有效，publishGroupAnswerRows 在链尾自然重发行状态
+                    val waitMs = ((outcome?.retryAfterSec ?: 30).coerceIn(30, 7200)) * 1000L
+                    viewModelScope.launch(Dispatchers.IO) {
+                        delay(waitMs)
+                        if (_groupAnswers.value?.first == q) kickGroupAnswerResolve(q)
+                    }
                 }
-            } finally {
-                // 在飞集合必须在 finally 里清：旧版异常路径漏清，链接永久卡"在飞"
-                // 不再重试也不进死信，对应行永远挂"识别中…"（挂死根因之一）
-                answerResolveInFlight.removeAll(links.toSet())
+                if (outcome != null) {
+                    for (ans in pendingTitleAnswers) {
+                        val hit = outcome.titles[ans.username.trim().removePrefix("@").lowercase()] ?: continue
+                        answerLinkChatCache[ans.link] = hit.first
+                    }
+                }
+                // 网页泳道补标题（SearchPublicChat 账号级 429 封死时与 TDLib 完全隔离的 IP 泳道）：
+                // TDLib 泳道跑完后仍缺标题的用户名走 t.me/s/ 预览页换真频道名——
+                // 回填答案库 hintTitle + 就地升级内存答案对象 + 重发行状态（与上方零网络线索链同套模式）
+                val stillMissingTitles = pendingTitleAnswers.filter { answerTitleOf(it).isEmpty() }
+                if (stillMissingTitles.isNotEmpty()) {
+                    val webInfos = real.resolveTitlesViaWeb(stillMissingTitles.map { it.username })
+                    if (webInfos.isNotEmpty()) {
+                        var changed = false
+                        for (ans in stillMissingTitles) {
+                            val info = webInfos[ans.username.trim().removePrefix("@").lowercase()] ?: continue
+                            // R48：标题与成员数（og:description 解析）一并回填答案库
+                            if (real.groupHarvester.answerStore.backfillHintTitle(ans.link, info.title, info.members) > 0) changed = true
+                        }
+                        if (changed) {
+                            // 当前行持有的答案对象是旧快照：就地升级 hintTitle/members 后重发
+                            val cur = _groupAnswers.value
+                            if (cur != null && cur.first == q) {
+                                _groupAnswers.value = q to cur.second.map { ans ->
+                                    val info = webInfos[ans.username.trim().removePrefix("@").lowercase()]
+                                    val newTitle = if (ans.hintTitle.isBlank()) info?.title ?: ans.hintTitle else ans.hintTitle
+                                    val newMembers = if (ans.members <= 0) info?.members ?: ans.members else ans.members
+                                    if (newTitle != ans.hintTitle || newMembers != ans.members) {
+                                        ans.copy(hintTitle = newTitle, members = newMembers)
+                                    } else ans
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        }
-        // "识别中"标题行懒解析（投诉"一直显示识别中"的修复）：没出内容卡、chatId==0 的
-        // 用户名链接（频道主页类链接永远出不了内容卡，正确呈现是带真标题的频道行）——
-        // 小预算 SearchPublicChat 换真 chatId+标题，成功回填 answerLinkChatCache，
-        // publish 时 answerTitleOf 借它出真标题；预算耗尽（null）放词闸下轮重试
-        val pendingTitleAnswers = answers.filter { ans ->
-            ans.chatId == 0L && ans.username.isNotBlank() &&
-                !answerItemCache.containsKey(ans.link) && answerTitleOf(ans).isEmpty()
-        }
-        if (pendingTitleAnswers.isNotEmpty()) {
-            val outcome = real.resolveAnswerTitles(pendingTitleAnswers.map { it.username }, live = false)
-            // 预算耗尽（null）或整批被 429 挤掉（hadFlood）：都放闸，下次搜同词重试——
-            // 闸已烧掉而解析没成功，该词整会话恒挂裸 @用户名（实证：搜索扇出并发期
-            // 历史区标题整批 0/12，是"答案区全是@id"投诉的主根因之一）
-            if (outcome == null || outcome.hadFlood) {
-                answerResolvedWords.remove(folded)
-                // 零网络标题回填（429 封死 SearchPublicChat 时的主链）：读答案来源会话的
-                // 最近历史，从内联按钮配对"链接→标题"线索（GetChatHistory 是另一条 API
-                // 泳道，实证不在 429 范围）——升级答案库空线索并即时重发行状态
-                viewModelScope.launch(Dispatchers.IO) {
-                    val fromGroups = pendingTitleAnswers.map { it.fromGroup }.distinct()
-                    if (fromGroups.isNotEmpty()) {
-                        val hints = real.harvestAnswerTitleHints(fromGroups)
+            // R48 成员数零网络回填（独立小链）：老答案标题已齐（上方标题链不触发）但成员数
+            // 未知时，读来源会话最近历史把应答行尾成员数补进库并就地升级重发——
+            // GetChatHistory 泳道零 SearchPublicChat 预算，一词随上方词闸每进程至多一轮
+            if (answers.any { it.members <= 0 }) {
+                val memberFromGroups = answers.filter { it.members <= 0 }.map { it.fromGroup }.distinct()
+                if (memberFromGroups.isNotEmpty()) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        // 成员数回填用大窗口（100 条/会话，单请求上限内）：bot 私聊近 50 条
+                        // 可能全是问答流水（提问+门页回复），📢 形态应答在更早的消息里
+                        val hints = real.harvestAnswerTitleHints(memberFromGroups, perChatLimit = 100)
                         var changed = false
                         for ((link, hint) in hints) {
-                            // R48：标题与行尾成员数（实体/位置配对解析）一并回填答案库
                             if (real.groupHarvester.answerStore.backfillHintTitle(link, hint.title, hint.members) > 0) changed = true
                         }
                         if (changed) {
@@ -534,85 +628,12 @@ internal fun FeedViewModel.kickGroupAnswerResolve(q: String) {
                         }
                     }
                 }
-                // 限流降级自动补踢（R44）：间隔吃服务端真实 retry-after（clamp 30s~2h）——
-                // 短波峰很快补上，封号级长封禁按真实节奏慢踢不硬撞
-                // （旧版 clamp 上限 600s：retry after 15000s 被压成每 10 分钟一批白撞墙）；
-                // 词闸已放出故重踢有效，publishGroupAnswerRows 在链尾自然重发行状态
-                val waitMs = ((outcome?.retryAfterSec ?: 30).coerceIn(30, 7200)) * 1000L
-                viewModelScope.launch(Dispatchers.IO) {
-                    delay(waitMs)
-                    if (_groupAnswers.value?.first == q) kickGroupAnswerResolve(q)
-                }
             }
-            if (outcome != null) {
-                for (ans in pendingTitleAnswers) {
-                    val hit = outcome.titles[ans.username.trim().removePrefix("@").lowercase()] ?: continue
-                    answerLinkChatCache[ans.link] = hit.first
-                }
-            }
-            // 网页泳道补标题（SearchPublicChat 账号级 429 封死时与 TDLib 完全隔离的 IP 泳道）：
-            // TDLib 泳道跑完后仍缺标题的用户名走 t.me/s/ 预览页换真频道名——
-            // 回填答案库 hintTitle + 就地升级内存答案对象 + 重发行状态（与上方零网络线索链同套模式）
-            val stillMissingTitles = pendingTitleAnswers.filter { answerTitleOf(it).isEmpty() }
-            if (stillMissingTitles.isNotEmpty()) {
-                val webInfos = real.resolveTitlesViaWeb(stillMissingTitles.map { it.username })
-                if (webInfos.isNotEmpty()) {
-                    var changed = false
-                    for (ans in stillMissingTitles) {
-                        val info = webInfos[ans.username.trim().removePrefix("@").lowercase()] ?: continue
-                        // R48：标题与成员数（og:description 解析）一并回填答案库
-                        if (real.groupHarvester.answerStore.backfillHintTitle(ans.link, info.title, info.members) > 0) changed = true
-                    }
-                    if (changed) {
-                        // 当前行持有的答案对象是旧快照：就地升级 hintTitle/members 后重发
-                        val cur = _groupAnswers.value
-                        if (cur != null && cur.first == q) {
-                            _groupAnswers.value = q to cur.second.map { ans ->
-                                val info = webInfos[ans.username.trim().removePrefix("@").lowercase()]
-                                val newTitle = if (ans.hintTitle.isBlank()) info?.title ?: ans.hintTitle else ans.hintTitle
-                                val newMembers = if (ans.members <= 0) info?.members ?: ans.members else ans.members
-                                if (newTitle != ans.hintTitle || newMembers != ans.members) {
-                                    ans.copy(hintTitle = newTitle, members = newMembers)
-                                } else ans
-                            }
-                        }
-                    }
-                }
-            }
+            publishGroupAnswerRows(q)
+        }.onFailure {
+            if (it is kotlinx.coroutines.CancellationException) throw it
+            android.util.Log.w("FeedViewModel", "kickGroupAnswerResolve: 解析协程异常收场（不崩进程）：${it.message}")
         }
-        // R48 成员数零网络回填（独立小链）：老答案标题已齐（上方标题链不触发）但成员数
-        // 未知时，读来源会话最近历史把应答行尾成员数补进库并就地升级重发——
-        // GetChatHistory 泳道零 SearchPublicChat 预算，一词随上方词闸每进程至多一轮
-        if (answers.any { it.members <= 0 }) {
-            val memberFromGroups = answers.filter { it.members <= 0 }.map { it.fromGroup }.distinct()
-            if (memberFromGroups.isNotEmpty()) {
-                viewModelScope.launch(Dispatchers.IO) {
-                    // 成员数回填用大窗口（100 条/会话，单请求上限内）：bot 私聊近 50 条
-                    // 可能全是问答流水（提问+门页回复），📢 形态应答在更早的消息里
-                    val hints = real.harvestAnswerTitleHints(memberFromGroups, perChatLimit = 100)
-                    var changed = false
-                    for ((link, hint) in hints) {
-                        if (real.groupHarvester.answerStore.backfillHintTitle(link, hint.title, hint.members) > 0) changed = true
-                    }
-                    if (changed) {
-                        // 当前行持有的答案对象是旧快照：就地升级 hintTitle/members 后重发
-                        val cur = _groupAnswers.value
-                        if (cur != null && cur.first == q) {
-                            _groupAnswers.value = q to cur.second.map { ans ->
-                                val hint = hints[ans.link]
-                                val newTitle = if (ans.hintTitle.isBlank()) hint?.title ?: ans.hintTitle else ans.hintTitle
-                                val newMembers = if (ans.members <= 0) hint?.members ?: ans.members else ans.members
-                                if (newTitle != ans.hintTitle || newMembers != ans.members) {
-                                    ans.copy(hintTitle = newTitle, members = newMembers)
-                                } else ans
-                            }
-                        }
-                        publishGroupAnswerRows(q)
-                    }
-                }
-            }
-        }
-        publishGroupAnswerRows(q)
     }
 }
 
@@ -955,9 +976,12 @@ internal suspend fun FeedViewModel.searchOneChannel(
     if (page.nextCursor != null) session.cursors[ch.id] = page.nextCursor
     else session.cursors.remove(ch.id) // 到底（nextFromMessageId=0）
     val nowSec = System.currentTimeMillis() / 1000L
-    val disliked = _dislikedKeys.value
+    // R413：可见性收口 VisibilityGate（屏蔽频道/不感兴趣/关键词屏蔽同一谓词）
+    val gate = visibilityGate()
+    var kwHits = 0
     for (item in page.items) {
-        if (item.key in disliked) continue // 硬过滤：不感兴趣单条不进搜索结果（§4.2）
+        if (gate.keyword.hits(item)) { kwHits++; continue }
+        if (!gate.passes(item)) continue // 硬过滤：不感兴趣单条不进搜索结果（§4.2）
         // 服务端结果本地复滤（实锤：TG 服务端对中文搜索乱匹配，返回一堆
         // caption 不含关键词的条目——inCaption=false 一片）。精确模式下
         // caption 不含查询词的直接丢；模糊模式靠打分权重不收硬性过滤
@@ -987,6 +1011,7 @@ internal suspend fun FeedViewModel.searchOneChannel(
     }
     // 流式并入走节流：频道完成洪峰时合并重排（防 30~540 次全量排序刷爆 UI 重组），
     // 波尾/收尾由 fanoutSearch/fullSearch 的 finally 强制发布兜底，尾部结果不丢
+    logKeywordMuteProbe("全频道搜索", gate.keyword, kwHits)
     publishFullSearchThrottled(session)
     if (cursor == null) advanceSearchCoverage(session)
     // 评论级联搜索（修复包 #5）：主帖首页搜完后顺带搜一次该频道评论里的媒体
@@ -1002,7 +1027,7 @@ internal suspend fun FeedViewModel.searchOneChannel(
             val commentItems = real.searchChannelComments(ch.id, session.query, FULL_SEARCH_COMMENT_LIMIT)
             if (commentItems.isNotEmpty()) {
                 for (item in commentItems) {
-                    if (item.key in disliked) continue // 与主帖同一可见性口径
+                    if (!gate.passes(item)) continue // 与主帖同一可见性口径（R413 含关键词屏蔽）
                     val score = searchScore(item, session, nowSec)
                     // R110：评论级联并入同池也过换入换出闸——旧路径无上限直 merge，
                     // 池满时评论结果绕过内存安全闸

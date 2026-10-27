@@ -9,6 +9,10 @@ import android.net.Uri
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import dev.tgfeed.MainActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -100,6 +104,12 @@ object MergedNotify {
     /** 渠道/清扫一次性闸（幂等 attach） */
     private val attached = AtomicBoolean(false)
 
+    /**
+     * R432 启动性能：attach 的清扫类 binder IPC 挪后台协程专用 scope。
+     * 常驻但零任务即零开销；只在 attach 首次触发时launch 一次。
+     */
+    private val sweepScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     /** 事件账本与发通知串行锁（对象锁；notify 本身线程安全，锁只保账目合并的原子性） */
     private val lock = Any()
 
@@ -132,6 +142,10 @@ object MergedNotify {
      * 挂接（幂等）：存 applicationContext + 建渠道（改名"订阅更新"）+ 删旧到货渠道 +
      * 清扫抽屉里旧分体通知残骸。由 DemandSubscription.attach 顺带调用（其挂接点在
      * AppPrefs.init——App.onCreate 即执行，进程启动早期完成迁移清扫，不等首条通知）。
+     * R432 启动性能：渠道创建保留调用线程（Android 要求首条 postNotification 前渠道
+     * 已存在，且本调用是全部后续通知的前置条件）；删旧渠道 + activeNotifications
+     * 两轮查询 + 逐条 cancel 属清扫类 binder IPC，挪 [sweepScope] 后台执行，不再
+     * 挡主线程启动。清扫幂等，与 notify 路径的兜底清扫共用对象锁串行。
      */
     fun attach(context: Context) {
         appContext = context.applicationContext
@@ -143,9 +157,13 @@ object MergedNotify {
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_DEFAULT),
             )
-            nm.deleteNotificationChannel(LEGACY_DEMAND_CHANNEL_ID)
-            sweepLegacyLocked(nm)
-            Log.i(TAG, "汇总通知已挂接：渠道=$CHANNEL_NAME 单条 id=$SUMMARY_ID，旧到货渠道已删除")
+            sweepScope.launch {
+                runCatching {
+                    nm.deleteNotificationChannel(LEGACY_DEMAND_CHANNEL_ID)
+                    synchronized(lock) { sweepLegacyLocked(nm) }
+                }.onFailure { Log.w(TAG, "旧渠道/残骸清扫失败（静默，不影响其余链路）: ${it.message}") }
+            }
+            Log.i(TAG, "汇总通知已挂接：渠道=$CHANNEL_NAME 单条 id=$SUMMARY_ID，旧到货渠道清扫已派后台")
         }.onFailure { Log.w(TAG, "汇总通知挂接失败（静默，不影响其余链路）: ${it.message}") }
     }
 

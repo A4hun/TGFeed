@@ -195,13 +195,12 @@ class PursuePolicyTest {
     // ---------------- R239 扁平完整流（时间窗内完整流，无每频道上限） ----------------
 
     @Test
-    fun `扁平流合并升序_最新在底_用户不变量延续`() {
+    fun `R418b扁平流合并升序_最新在底`() {
         val old = item(-101, 1, CUTOFF + 100)
         val mid = item(-102, 1, CUTOFF + 3_600)
         val newest = item(-103, 1, NOW_SEC - 10)
-        val merged = pursueTimelineMerge(emptyList(), listOf(newest, mid, old), CUTOFF)
+        val merged = pursueTimelineMerge(emptyList(), listOf(old, newest, mid), CUTOFF)
         assertEquals(3, merged.size)
-        // 升序：index 0 最旧 → 末尾最新（「最新在最下面」拍板延续）
         assertTrue(merged.zipWithNext().all { (a, b) -> a.dateEpochSec <= b.dateEpochSec })
         assertEquals(CUTOFF + 100, merged[0].dateEpochSec.toLong())
         assertEquals(NOW_SEC - 10, merged[2].dateEpochSec.toLong())
@@ -263,23 +262,178 @@ class PursuePolicyTest {
         val pool = (1..100).map { item(-101L, it.toLong(), CUTOFF + it) }
         val merged = pursueTimelineMerge(emptyList(), pool, CUTOFF, hardCap = 30)
         assertEquals(30, merged.size)
-        assertEquals(100L, merged.last().messageId) // 最新端在
-        assertEquals(71L, merged.first().messageId) // 最旧侧被裁
+        assertEquals(100L, merged.last().messageId) // 最新端在（升序底）
+        assertEquals(71L, merged.first().messageId) // 最旧侧（头）被裁
     }
 
     @Test
-    fun `新内容计数_只有晚于旧流最新端的新key计数`() {
+    fun `R418b追底计数_只有晚于旧流最新端的新key计数`() {
         val old = listOf(item(-101, 1, NOW_SEC - 100))
-        val merged = listOf(
-            item(-101, 1, NOW_SEC - 100),          // 旧条目
-            item(-102, 2, NOW_SEC - 50),           // 新 append（晚于旧最新）
-            item(-103, 3, NOW_SEC - 10),           // 新 append
+        val merged = pursueTimelineMerge(
+            old,
+            listOf(item(-102, 2, NOW_SEC - 50), item(-103, 3, NOW_SEC - 10), item(-104, 4, NOW_SEC - 500)),
+            CUTOFF,
         )
-        assertEquals(2, pursueTimelineAppendCount(old, merged))
-        // 归并重排（无新增）不计数
-        assertEquals(0, pursueTimelineAppendCount(merged, merged))
+        assertEquals(2, pursueTimelineNewerCount(old, merged)) // 头部历史不算
+        assertEquals(0, pursueTimelineNewerCount(merged, merged))
+        assertEquals(0, pursueTimelineNewerCount(emptyList(), merged)) // 首屏不计
     }
 
+    // ---------------- R418 升序主轴/游标/可见性/地板/保位 ----------------
+
+    @Test
+    fun `R418b排序决胜_同秒按chatId再msgId升序`() {
+        val t = NOW_SEC - 10
+        val a = item(-5, 1, t)
+        val b = item(-3, 1, t)
+        val c = item(-3, 9, t)
+        val d = item(-9, 1, t + 1)
+        val merged = pursueTimelineMerge(emptyList(), listOf(a, b, c, d), CUTOFF)
+        assertEquals(listOf(a.key, b.key, c.key, d.key), merged.map { it.key })
+    }
+
+    @Test
+    fun `R418merge可见性keep过滤_既有条目同样复判`() {
+        val keepMe = item(-101, 1, NOW_SEC - 10)
+        val blocked = item(-666, 1, NOW_SEC - 20)
+        val merged = pursueTimelineMerge(listOf(blocked), listOf(keepMe), CUTOFF, keep = { it.chatId != -666L })
+        assertEquals(listOf(keepMe.key), merged.map { it.key })
+    }
+
+    @Test
+    fun `R418历史地板先下移_窗下历史产物不被裁`() {
+        val hist = listOf(item(-101, 1, CUTOFF - 5_000), item(-101, 2, CUTOFF - 9_000))
+        val floor = pursueHistoryFloorAfter(0L, hist, NOW_SEC, WINDOW, history = true)
+        assertEquals(CUTOFF - 9_000, floor)
+        val merged = pursueTimelineMerge(emptyList(), hist, pursueTimelineCutoffSec(NOW_SEC, WINDOW, floor))
+        assertEquals(2, merged.size)
+        assertEquals(0L, pursueHistoryFloorAfter(0L, hist, NOW_SEC, WINDOW, history = false))
+        assertEquals(CUTOFF - 9_000, pursueHistoryFloorAfter(CUTOFF - 9_000, listOf(item(1, 1, CUTOFF - 10)), NOW_SEC, WINDOW, true))
+    }
+
+    // 模拟 SQL：窗内按秒 desc（同秒内次序任意——这里按 msgId 升序故意打乱）截 limit
+    private fun fakeQuery(all: List<VideoItem>, from: Long, to: Long, limit: Int): List<VideoItem> =
+        all.filter { it.dateEpochSec.toLong() in from..to }
+            .sortedWith(compareByDescending<VideoItem> { it.dateEpochSec }.thenBy { it.messageId })
+            .take(limit)
+
+    private fun drainIndex(all: List<VideoItem>, start: PursueCursor, step: Long, limit: Int): List<VideoItem> {
+        var cursor = start
+        val out = ArrayList<VideoItem>()
+        repeat(500) {
+            val w = pursueIndexWindow(cursor, step) ?: return out
+            val st = pursueIndexStep(cursor, fakeQuery(all, w.first, w.second, limit), w.first, limit)
+            out += st.items
+            if (st.next == cursor) return out
+            cursor = st.next
+        }
+        return out
+    }
+
+    @Test
+    fun `R418索引游标分页不重不漏_含同秒批量与满页截断`() {
+        val base = 10_000L
+        val all = ArrayList<VideoItem>()
+        var m = 0L
+        for (s in 0 until 40) {
+            val n = if (s % 7 == 0) 5 else 1
+            repeat(n) { all += item(-(100L + (m % 3)), ++m, base + s * 10) }
+        }
+        val top = all.maxByOrNull { it.dateEpochSec }!!
+        val start = pursueCursorOf(top)
+        // limit ≥ 同秒批量(5)：同秒超一页属 SQL 秒级排序固有病态（让过该秒，挂账）
+        for (limit in listOf(5, 6, 7, 11, 1000)) {
+            val keys = drainIndex(all, start, 50L, limit).map { it.key }
+            assertEquals("limit=${limit} dup", keys.size, keys.toSet().size)
+            val expect = all.filter { pursueOlderThan(it, start) }.map { it.key }.toSet()
+            assertEquals("limit=${limit} miss", expect, keys.toSet())
+        }
+    }
+
+    @Test
+    fun `R418索引游标_同秒游标只取元组更旧者`() {
+        val t = 5_000L
+        val cur = PursueCursor(t, -3, 5)
+        val hits = listOf(item(-3, 6, t), item(-3, 4, t), item(-2, 1, t), item(-4, 1, t), item(-1, 1, t - 1))
+        val st = pursueIndexStep(cur, hits, t - 100, 1000)
+        assertEquals(setOf("tg:-3:4", "tg:-4:1", "tg:-1:1"), st.items.map { it.key }.toSet())
+        assertEquals(PursueCursor.belowSecond(t - 100), st.next)
+    }
+
+    @Test
+    fun `R418保位_锚下标移动才回位`() {
+        val keys = listOf("n2", "n1", "a", "b")
+        assertEquals(2, pursueAnchorRestoreIndex(keys, "a", 0))
+        assertNull(pursueAnchorRestoreIndex(keys, "a", 2))
+        assertNull(pursueAnchorRestoreIndex(keys, "gone", 0))
+        assertNull(pursueAnchorRestoreIndex(keys, null, 0))
+    }
+
+    @Test
+    fun `R418b卡片升序_最新卡在底_尾追加不换旧卡key`() {
+        val older = listOf(item(-1, 1, NOW_SEC - 10_000), item(-1, 2, NOW_SEC - 9_990))
+        val s1 = pursueTimelineMerge(emptyList(), older, CUTOFF)
+        val c1 = pursueTimelineCards(s1)
+        val s2 = pursueTimelineMerge(s1, listOf(item(-2, 1, NOW_SEC - 10)), CUTOFF)
+        val c2 = pursueTimelineCards(s2)
+        assertEquals(-2L, c2.last().chatId)
+        assertEquals(c1.first().items.first().key, c2.first().items.first().key)
+    }
+
+    @Test
+    fun `R418b增量归并_尾追加不重排_既有条目实例复用`() {
+        val base = (1..50).map { item(-(it % 4 + 1).toLong(), it.toLong(), NOW_SEC - 10_000 + it * 10) }
+        val s1 = pursueTimelineMerge(emptyList(), base.shuffled(java.util.Random(7)), CUTOFF)
+        val live = listOf(item(-9, 999, NOW_SEC - 5), item(-8, 998, NOW_SEC - 6))
+        val s2 = pursueTimelineMerge(s1, live, CUTOFF)
+        assertEquals(52, s2.size)
+        for (k in s1.indices) assertTrue(s1[k] === s2[k]) // 前缀原样（未重排）
+        assertEquals(listOf("tg:-8:998", "tg:-9:999"), s2.takeLast(2).map { it.key })
+        assertEquals(2, pursueTimelineNewerCount(s1, s2))
+    }
+
+    @Test
+    fun `R418b增量归并_中段插入与全量排序结果一致`() {
+        val rnd = java.util.Random(42)
+        val a = (1..200).map { item(-(rnd.nextInt(5) + 1).toLong(), it.toLong(), NOW_SEC - rnd.nextInt(20_000)) }
+        val b = (201..260).map { item(-(rnd.nextInt(5) + 1).toLong(), it.toLong(), NOW_SEC - rnd.nextInt(20_000)) } +
+            a.take(10).map { it.copy(playUri = "u") } // 覆盖既有 key
+        val s1 = pursueTimelineMerge(emptyList(), a, CUTOFF)
+        val s2 = pursueTimelineMerge(s1, b, CUTOFF)
+        val expect = (a + b).associateBy { it.key }.values.sortedWith(PURSUE_TIMELINE_ORDER)
+        assertEquals(expect.map { it.key }, s2.map { it.key })
+        assertEquals(10, s2.count { it.playUri == "u" })
+    }
+
+    @Test
+    fun `R418b增量分卡_与全量分卡恒等`() {
+        val s1 = pursueTimelineMerge(
+            emptyList(),
+            listOf(item(-1, 1, NOW_SEC - 9_000), item(-1, 2, NOW_SEC - 8_990), item(-2, 1, NOW_SEC - 8_000)),
+            CUTOFF,
+        )
+        val c1 = pursueTimelineCards(s1)
+        // 尾追加：同频道紧邻=并入末卡；换频道=新卡
+        val s2 = pursueTimelineMerge(s1, listOf(item(-2, 2, NOW_SEC - 7_990), item(-3, 1, NOW_SEC - 10)), CUTOFF)
+        val inc = pursueTimelineCardsIncremental(s1, c1, s2)
+        assertEquals(pursueTimelineCards(s2), inc)
+        assertTrue(inc.first() === c1.first()) // 未受影响的旧卡复用
+        // 头部插入：退化全量，仍恒等
+        val s3 = pursueTimelineMerge(s2, listOf(item(-4, 1, NOW_SEC - 20_000)), CUTOFF)
+        assertEquals(pursueTimelineCards(s3), pursueTimelineCardsIncremental(s2, inc, s3))
+        // 流不变：原卡表返回
+        assertTrue(pursueTimelineCardsIncremental(s3, inc, s3).isNotEmpty())
+    }
+
+    @Test
+    fun `R418b视口判定_在底跟随_回看保位_头插保位`() {
+        assertEquals(PursueViewportAction.FOLLOW_BOTTOM, pursueViewportAction(true, "a", "a", "z", "z2"))
+        assertEquals(PursueViewportAction.HOLD_ANCHOR, pursueViewportAction(false, "a", "a", "z", "z2"))
+        assertEquals(PursueViewportAction.HOLD_ANCHOR, pursueViewportAction(true, "a", "a0", "z", "z"))
+        assertEquals(PursueViewportAction.HOLD_ANCHOR, pursueViewportAction(false, "a", "a0", "z", "z"))
+        assertEquals(PursueViewportAction.NONE, pursueViewportAction(true, "a", "a", "z", "z"))
+        assertEquals(PursueViewportAction.NONE, pursueViewportAction(true, null, "a", null, "z")) // 首屏归落底逻辑
+    }
     @Test
     fun `历史fallback窗_floor以下一步_越界null`() {
         assertEquals((CUTOFF - 86400) to (CUTOFF - 1), pursueHistoryFallbackWindow(CUTOFF, 86400L))

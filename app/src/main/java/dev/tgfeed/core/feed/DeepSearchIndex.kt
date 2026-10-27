@@ -278,6 +278,19 @@ internal fun tagItemsSlicedJoinSql(colsFromItems: String): String =
         "ORDER BY items.dateEpochSec DESC LIMIT ?"
 
 /**
+ * R408b 行星世界卡代表作分页的 SQL 形状（纯函数，[tagItemsJoinSql] 同款 R269 机检锚）：
+ * 某频道+某 tag 的条目一页，**messageId 新到旧**（与 channelItemsPage 同序口径）。
+ *  - `tag_items CROSS JOIN items`：锁死 tag_items 驱动——WHERE chatId=? AND tag=? 命中
+ *    idx_tag_items_chat (chatId, tag) 前缀，items 侧 rowid 点查；候选集恒 ≤ 该频道该 tag
+ *    自身行数（有界，非全库扫）；
+ *  - 列名全限定（tag_items 也有 chatId 列，裸列名歧义）；LIMIT ? OFFSET ? 分页。
+ */
+internal fun channelTagItemsPageSql(colsFromItems: String): String =
+    "SELECT $colsFromItems FROM tag_items CROSS JOIN items ON items.rowid = tag_items.rowid_ref " +
+        "WHERE tag_items.chatId=? AND tag_items.tag=? " +
+        "ORDER BY items.messageId DESC LIMIT ? OFFSET ?"
+
+/**
  * R317 发布直方图点查件的 SQL 形状（纯函数，[tagItemsJoinSql] 同款 R269 机检锚——防
  * 27dd5a8 类 FROM/谓词误删漂移）。口径=[monthHistogram] 既有日粒度直方图的**频道版**
  * （`GROUP BY dateEpochSec/86400`；WHERE chatId=? 频道域点查——**有界成本非全库扫描**：
@@ -2384,6 +2397,32 @@ class DeepSearchIndex(
         )
     }
 
+    /**
+     * R408b：读某频道+某 tag 的索引条目一页（messageId 新→旧，LIMIT+OFFSET 有界）——星图
+     * 行星世界卡「代表作」动态装载的数据源（恒星信息卡走 [channelItemsPage]，行星=该频道
+     * 内带该 tag 的子集，同序同分页口径）。tag 折叠键与 [tagItems] 同一把尺子（[tagKeyOf]）。
+     * SQL 形状收口纯函数 [channelTagItemsPageSql]。只读 items 主表臂（tag_items 只挂 items
+     * 行，refs 侧无 tag 归属）。**请在 IO 线程调用**；空 tag/参数越界/查询失败返回空表
+     * （调用侧回落快照样本=诚实降级）。
+     */
+    fun channelTagItemsPage(chatId: Long, tag: String, limit: Int, offset: Int): List<VideoItem> {
+        if (limit <= 0 || offset < 0) return emptyList()
+        val key = tagKeyOf(tag)
+        if (key.isEmpty()) return emptyList()
+        return runCatching {
+            val d = openDb()
+            val out = ArrayList<VideoItem>(minOf(limit, 64))
+            d.rawQuery(
+                channelTagItemsPageSql(ITEM_COLS_FROM_ITEMS),
+                arrayOf(chatId.toString(), key, limit.toString(), offset.toString()),
+            ).use { c -> while (c.moveToNext()) out += rowToItem(c) }
+            out
+        }.getOrElse {
+            Log.e(TAG, "R408b channelTagItemsPage 查询失败", it)
+            emptyList()
+        }
+    }
+
     // ---------------- R236 v9 tags 表查询（只加不改；全部索引导航毫秒级，零全表扫） ----------------
 
     /**
@@ -2582,6 +2621,58 @@ class DeepSearchIndex(
             out
         }.getOrElse {
             Log.e(TAG, "R236 topTags 查询失败 chatId=$chatId", it)
+            emptyList()
+        }
+    }
+
+    /**
+     * R412：行星覆盖纯计数体检（只读、零网络、**零内容**——只出计数，不出 tag/名字）。
+     * 对给定频道集逐个取：tags 账本行数（PK chatId 前缀 COUNT，毫秒级）+ 近端
+     * [sampleLimit] 条样本的 item_tags 三态计数（未解析 NULL / 已解析无标签 "[]" /
+     * 有标签）——idx_items_chat_msg 区间有界（回表 ≤ sampleLimit），与行星装配
+     * 同一取样口径（channelItemsPage 的 items 臂近似）。**请在 IO 线程调用**。
+     */
+    data class PlanetCoverageRow(
+        val chatId: Long,
+        val ledgerTags: Int,
+        val sampleRows: Int,
+        val sampleNull: Int,
+        val sampleEmpty: Int,
+        val sampleTagged: Int,
+    )
+
+    fun planetCoverageCounts(chatIds: Collection<Long>, sampleLimit: Int): List<PlanetCoverageRow> {
+        return runCatching {
+            val d = openDb()
+            val out = ArrayList<PlanetCoverageRow>(chatIds.size)
+            for (id in chatIds) {
+                val ledger = d.rawQuery(
+                    "SELECT COUNT(*) FROM $TAGS_TABLE WHERE chatId=?",
+                    arrayOf(id.toString()),
+                ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+                var rows = 0
+                var nul = 0
+                var empty = 0
+                var tagged = 0
+                d.rawQuery(
+                    "SELECT $ITEM_TAGS_COL FROM items WHERE chatId=? ORDER BY messageId DESC LIMIT ?",
+                    arrayOf(id.toString(), sampleLimit.toString()),
+                ).use { c ->
+                    while (c.moveToNext()) {
+                        rows++
+                        val j = if (c.isNull(0)) null else c.getString(0)
+                        when {
+                            j == null -> nul++
+                            j.trim() == "[]" || j.isBlank() -> empty++
+                            else -> tagged++
+                        }
+                    }
+                }
+                out += PlanetCoverageRow(id, ledger, rows, nul, empty, tagged)
+            }
+            out
+        }.getOrElse {
+            Log.e(TAG, "R412 行星覆盖计数失败", it)
             emptyList()
         }
     }
@@ -7678,7 +7769,18 @@ class DeepSearchIndex(
     }.getOrNull()
 
     private fun writeBackfillState(s: BackfillState) {
-        runCatching { backfillStateFile().writeText("{\"phase\":${s.phase},\"cursor\":${s.cursor},\"filled\":${s.filled},\"sweep\":${s.sweep},\"done\":${s.done}}") }
+        // 原子写（tmp+rename；R428 对齐 writeMergeState 先例——直写半途死亡留残串
+        // 则正则失配游标归零重扫，delta 幂等保正确性但白扫）
+        runCatching {
+            val tmp = File(storeDir, "caption_backfill_v8r2.json.tmp")
+            tmp.writeText("{\"phase\":${s.phase},\"cursor\":${s.cursor},\"filled\":${s.filled},\"sweep\":${s.sweep},\"done\":${s.done}}")
+            if (!tmp.renameTo(backfillStateFile())) {
+                tmp.delete()
+                backfillStateFile().writeText(
+                    "{\"phase\":${s.phase},\"cursor\":${s.cursor},\"filled\":${s.filled},\"sweep\":${s.sweep},\"done\":${s.done}}",
+                )
+            }
+        }
     }
 
     /** 回填单飞点火（openDb 尾部；与 R202 时间索引同款单飞闸模式） */

@@ -183,7 +183,9 @@ internal fun AudioCard(
     // v6 底部操作排：复用 FeedScreen 与视频卡同一套回调；默认值保证旧调用可编译
     liked: Boolean = false,
     favorited: Boolean = false,
-    downloadStatus: DownloadStatus? = null,
+    // R432 重组收敛：下载表 State 本体下传（卡片内按 item.key 现查），下载 1Hz
+    // 进度不再经值参链把整页拖进重组；null = 旧调用不接线（回落无下载态显示）
+    downloads: androidx.compose.runtime.State<Map<String, DownloadStatus>>? = null,
     onToggleLike: () -> Unit = {},
     onToggleFavorite: () -> Unit = {},
     onDownload: () -> Unit = {},
@@ -208,6 +210,8 @@ internal fun AudioCard(
     onBack: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
+    // R432 重组收敛：叶子查表点（卡片组合期单次读；1Hz 进度只重组下方下载格）
+    val downloadStatus = downloads?.value?.get(item.key)
     // 响应式档位（Responsive.kt）：封面封顶 + 控件/间距缩放走 dp 通道；
     // 文本缩放走 sp 通道（TierFontScale 包裹全卡下发，不动 dp 布局与手势热区）
     val windowSize = rememberWindowSize()

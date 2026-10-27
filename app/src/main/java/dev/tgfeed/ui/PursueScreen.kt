@@ -57,6 +57,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -70,7 +71,10 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.tgfeed.core.feed.PursueTimelineCard
 import dev.tgfeed.core.feed.PursueViewModel
 import dev.tgfeed.core.feed.PursueViewModelFactory
-import dev.tgfeed.core.feed.pursueTimelineCards
+import dev.tgfeed.core.feed.PursueViewportAction
+import dev.tgfeed.core.feed.pursueAnchorRestoreIndex
+import dev.tgfeed.core.feed.pursueViewportAction
+import dev.tgfeed.core.feed.VisibilityGate
 import dev.tgfeed.core.feed.titleLine
 import dev.tgfeed.core.td.MockTdGateway
 import dev.tgfeed.core.td.TdGateway
@@ -89,6 +93,7 @@ import dev.tgfeed.ui.components.relativeTimeZh
 import dev.tgfeed.ui.theme.ChannelIdentity
 import dev.tgfeed.ui.theme.TgFeedTokens
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -172,15 +177,19 @@ internal fun PursueScreen(
     // 渐进合并/实时推入会在中间插行=平移索引）下托管 index 只是近似位，按卡 key
     // 重定位恒回「刚才那条」；null=未接（其他调用方）走纯 index 恢复。
     positionAnchor: androidx.compose.runtime.MutableState<Pair<String?, Int>>? = null,
+    // R418 可见性谓词源（共享 FeedViewModel.visibilityGate()；null=不过滤）
+    visibility: () -> VisibilityGate? = { null },
 ) {
     val vm: PursueViewModel = viewModel(
-        factory = PursueViewModelFactory(gateway, deepIndex),
+        factory = PursueViewModelFactory(gateway, deepIndex, visibility),
         key = "pursue-gw" + System.identityHashCode(gateway),
     )
     val stream by vm.items.collectAsState()
     val loading by vm.loading.collectAsState()
     val bootstrapped by vm.bootstrapped.collectAsState()
-    val bootstrapProgress by vm.bootstrapProgress.collectAsState()
+    // R432 重组收敛：bootstrapProgress 的 collect 下移进 PursueHeader（该流在拉取期
+    // 高频变更「N/总数」，顶层取值会让 PursueScreen 整页每变更全量重组；收进
+    // 头部叶子后只有头部那一小行文字重组）
     val historyLoading by vm.historyLoading.collectAsState()
     val historyExhausted by vm.historyExhausted.collectAsState()
     val newBelow by vm.newBelow.collectAsState()
@@ -203,7 +212,9 @@ internal fun PursueScreen(
     val listState = hostedListState ?: localListState
     // R240 呈现分批（纯函数，流实例变才重算）：完整流语义在数据面保持，
     // 这里只决定怎么「摆盘」（相邻同频道同批合卡）
-    val cards = remember(stream) { pursueTimelineCards(stream) }
+    // R418b 卡片流升序（最新卡在底）：VM 在后台线程随流算好（尾追加增量分卡），
+    // 主线程组合期零分卡开销
+    val cards by vm.cards.collectAsState()
     // 进 tab 自动滚到底：落定进 tab（或首个非空批次到达）即落到最新卡——「从最新
     // 开始往上回看」的用户终审直觉。实时推入**不**拽位（用户在上方回看时新内容
     // 安静排队——胶囊计数）。
@@ -231,29 +242,63 @@ internal fun PursueScreen(
             // 仍远优于拽底）。滚完再消费复位令（新开路径不受影响）。
             val anchor = positionAnchor?.value
             if (anchor?.first != null) {
-                val anchorIdx = cards.indexOfFirst { pursueCardKey(it) == anchor.first }
-                if (anchorIdx >= 0 && anchorIdx != listState.firstVisibleItemIndex) {
-                    listState.scrollToItem(anchorIdx, anchor.second)
-                }
+                val anchorIdx = pursueAnchorRestoreIndex(
+                    cards.map { pursueCardKey(it) }, anchor.first, listState.firstVisibleItemIndex,
+                )
+                if (anchorIdx != null) listState.scrollToItem(anchorIdx, anchor.second)
             }
             onReturnLandingConsumed()
         }
     }
     LaunchedEffect(pageActive, cards.size) {
         if (pageActive && !landedForEntry && cards.isNotEmpty()) {
-            listState.scrollToItem(cards.lastIndex)
+            listState.scrollToItem(cards.lastIndex) // 进页落在最新端（底）
             landedForEntry = true
         }
     }
-    // 用户在底部判定（胶囊清零的判据）：滚不动向前=在最新端
+    // 用户在底部判定（底=最新端；胶囊清零判据）：滚不动向前=在最新端
     val atBottom by remember {
         derivedStateOf { !listState.canScrollForward }
     }
     LaunchedEffect(atBottom) { vm.setUserAtBottom(atBottom) }
+    // R418b 视口跟随/保位：卡片流每次发布后按纯函数判定——用户在底且尾部新增 → 跟随到最新；
+    // 头部插入（历史预取）或用户在中段回看时尾部追加 → 按首可见卡 key 锚定回位（不跳）。
+    // 视口快照（锚 key/偏移/是否在底）只随滚动更新——内容增长不改「刚才是否在底」。
+    val viewport = remember { arrayOfNulls<Any>(5) } // 0 首卡 key,1 末卡 key,2 锚 key,3 锚偏移,4 在底
+    LaunchedEffect(cards) {
+        val newFirst = cards.firstOrNull()?.let { pursueCardKey(it) }
+        val newLast = cards.lastOrNull()?.let { pursueCardKey(it) }
+        val wasAtBottom = (viewport[4] as? Boolean) ?: true
+        when (
+            pursueViewportAction(wasAtBottom, viewport[0] as? String, newFirst, viewport[1] as? String, newLast)
+        ) {
+            PursueViewportAction.FOLLOW_BOTTOM -> if (cards.isNotEmpty()) listState.scrollToItem(cards.lastIndex)
+            PursueViewportAction.HOLD_ANCHOR -> {
+                val idx = pursueAnchorRestoreIndex(
+                    cards.map { pursueCardKey(it) }, viewport[2] as? String, listState.firstVisibleItemIndex,
+                )
+                if (idx != null) listState.scrollToItem(idx, (viewport[3] as? Int) ?: 0)
+            }
+            PursueViewportAction.NONE -> Unit
+        }
+        viewport[0] = newFirst
+        viewport[1] = newLast
+        // R418b 探针：等下一帧真正上屏后回报（首屏/推送毫秒）
+        if (cards.isNotEmpty()) {
+            androidx.compose.runtime.withFrameNanos { }
+            vm.reportRendered(cards.size)
+        }
+        snapshotFlow {
+            Triple(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset, !listState.canScrollForward)
+        }.collect { (i, off, bottom) ->
+            viewport[2] = cards.getOrNull(i)?.let { pursueCardKey(it) }
+            viewport[3] = off
+            viewport[4] = bottom
+        }
+    }
     // 历史轮触发（游标推进+写回索引；VM 侧幂等闸兜底防抖）：**近顶预取**——第一可见卡
-    // 进入距顶 PURSUE_HISTORY_PREFETCH_ROWS 行内即触发（R239 真机口径原样：卡高≈格行
-    // 高，18 行预载半径同量级；预取让更早内容在到顶前就位，prepend 由卡 key 锚定滚动
-    // 位零跳动）。键含 cards.size/historyLoading/loading：合并完成/轮收拍后重估一次
+    // 进入距顶 PURSUE_HISTORY_PREFETCH_ROWS 行内即触发（更早内容在到顶前就位，头部插入
+    // 由卡 key 锚定保位）。键含 cards.size/historyLoading/loading：合并完成/轮收拍后重估一次
     // 近顶态（快照流只在滚动时发射，纯状态推进不滚动时会漏）。
     LaunchedEffect(cards.size, historyLoading, loading) {
         snapshotFlow { listState.firstVisibleItemIndex <= dev.tgfeed.core.feed.PURSUE_HISTORY_PREFETCH_ROWS }
@@ -313,7 +358,7 @@ internal fun PursueScreen(
             .statusBarsPadding(),
     ) {
         PursueHeader(
-            bootstrapProgress = bootstrapProgress,
+            bootstrapProgressFlow = vm.bootstrapProgress,
             onSelectFollowing = onSelectFollowing,
             onSelectTimeline = {}, // 时间线恒激活态：本 tab 单击无操作（TopLevelTab 已激活语义）
             onSelectAggregate = onSelectAggregate,
@@ -334,7 +379,8 @@ internal fun PursueScreen(
                         state = listState,
                         modifier = Modifier
                             .fillMaxSize()
-                            .navigationBarsPadding(),
+                            .navigationBarsPadding()
+                            .testTag(UiTestTags.TIMELINE_LIST),
                         verticalArrangement = Arrangement.spacedBy(TgFeedTokens.GapMd),
                         contentPadding = PaddingValues(
                             top = TgFeedTokens.GapSm,
@@ -374,7 +420,12 @@ internal fun PursueScreen(
                 }
             }
             // 顶缘状态胶囊：历史轮在飞/诚实终态（滑到顶才可见的反馈，不遮内容）
-            val atTopNow = !listState.canScrollBackward
+            // R432 重组收敛：derivedStateOf 包裹裸读 canScrollBackward（对照同文件
+            // atBottom 的正确写法）——裸读让本 lambda 所在的整个 Box 作用域订阅
+            // 每帧滚动位置，滚动全程全页重组；派生后只在越过顶/非顶边界时重组
+            val atTopNow by remember {
+                derivedStateOf { !listState.canScrollBackward }
+            }
             val topStatus = when {
                 historyLoading -> "正在翻更早的内容…"
                 historyExhausted && atTopNow && stream.isNotEmpty() -> "已经到最早了"
@@ -401,7 +452,7 @@ internal fun PursueScreen(
             ) {
                 Row(
                     Modifier
-                        .padding(bottom = TgFeedTokens.GapXl)
+                        .padding(bottom = LocalBottomBarInset.current + TgFeedTokens.GapXl)
                         .clip(RoundedCornerShape(TgFeedTokens.RadiusPill))
                         .background(TgFeedTokens.AccentRed)
                         .clickable {
@@ -443,12 +494,15 @@ private fun pursueCardKey(card: PursueTimelineCard): String =
  */
 @Composable
 private fun PursueHeader(
-    bootstrapProgress: String?,
+    // R432 重组收敛：流本体下传、collect 收在本头部内——拉取期「N/总数」高频变更
+    // 只重组本头部那一小行，PursueScreen 整页不再跟着全量重组
+    bootstrapProgressFlow: StateFlow<String?>,
     onSelectFollowing: () -> Unit,
     onSelectTimeline: () -> Unit,
     onSelectAggregate: () -> Unit,
     onRefreshTimeline: () -> Unit,
 ) {
+    val bootstrapProgress by bootstrapProgressFlow.collectAsState()
     Row(
         Modifier
             .fillMaxWidth()

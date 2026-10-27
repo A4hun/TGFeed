@@ -57,7 +57,9 @@ class MultiSync(
 ) {
 
     enum class Domain(val id: String) {
-        FAV("fav"), LATER("later"), BLK("blk"), DIS("dis"), BITEM("bitem"), SUBS("subs")
+        FAV("fav"), LATER("later"), BLK("blk"), DIS("dis"), BITEM("bitem"), SUBS("subs"),
+        /** R413 关键词屏蔽词表（成员=屏蔽词原形；加入戳+墓碑在台账，同 dis 域口径） */
+        KW("kw")
     }
 
     companion object {
@@ -388,6 +390,14 @@ class MultiSync(
                 ledgerA.keys.removeAll { it !in added }
                 SyncPayload.DomainState(added = added, removed = prunedTombs(d, added))
             }
+            Domain.KW -> {
+                val members = runCatching { store.loadMutedKeywords() }.getOrDefault(emptySet())
+                val ledgerA = ledgerOf(addedLedger, d)
+                val added = LinkedHashMap<String, Long>()
+                members.forEach { if (it.isNotEmpty()) added[it] = ledgerA[it] ?: 0L }
+                ledgerA.keys.removeAll { it !in added }
+                SyncPayload.DomainState(added = added, removed = prunedTombs(d, added))
+            }
             Domain.BITEM -> {
                 val items = runCatching { store.loadBlockedItems() }.getOrDefault(emptyList())
                 val added = LinkedHashMap<String, Long>()
@@ -644,7 +654,36 @@ class MultiSync(
                     runCatching { store.saveDisliked(out) }
                     onApplied(setOf(d))
                 }
+            }            Domain.KW -> {
+                val cur = runCatching { store.loadMutedKeywords() }.getOrDefault(emptySet())
+                val out = LinkedHashSet(cur)
+                val keys = LinkedHashSet<String>().apply {
+                    addAll(cur); addAll(remote.added.keys); addAll(remote.removed.keys)
+                }
+                synchronized(ledgerLock) {
+                    ensureLedgerLoadedLocked()
+                    val ledgerA = ledgerOf(addedLedger, d)
+                    val tombs = ledgerOf(tombLedger, d)
+                    for (key in keys) {
+                        if (key.isBlank()) continue
+                        val present = key in cur
+                        val m = SyncMergePolicy.mergeSetKey(
+                            present, if (present) ledgerA[key] ?: 0L else 0L, tombs[key] ?: 0L,
+                            remote.added[key] ?: 0L, key in remote.added, remote.removed[key] ?: 0L, now,
+                        )
+                        if (m.present && !present) { out += key; if (m.added > 0L) ledgerA[key] = m.added; changed++ }
+                        if (!m.present && present) { out -= key; if (m.removed > 0L) tombs[key] = m.removed; changed++ }
+                        if (m.present && m.added >= m.removed) tombs.remove(key)
+                    }
+                    if (changed > 0) persistLedgerLocked()
+                }
+                if (changed > 0) {
+                    // 对端词表可能含本机 fold 等价的变体：落盘前过同一把尺去重/限长
+                    runCatching { store.saveMutedKeywords(KeywordMutePolicy.sanitize(out)) }
+                    onApplied(setOf(d))
+                }
             }
+
             Domain.BITEM -> {
                 val items = runCatching { store.loadBlockedItems() }.getOrDefault(emptyList())
                 fun identityOf(b: BlockedItem) = b.fileUniqueId.ifEmpty { b.key }

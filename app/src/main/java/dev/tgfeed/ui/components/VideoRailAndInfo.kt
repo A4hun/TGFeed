@@ -25,6 +25,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.State
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,7 +73,9 @@ internal fun BoxScope.VideoRightRail(
     onSubscribe: () -> Unit,
     liked: Boolean,
     favorited: Boolean,
-    downloadStatus: DownloadStatus?,
+    // R432 重组收敛：下载表 State 本体透传（ActionRail 内现查 downloadKey）
+    downloads: State<Map<String, DownloadStatus>>,
+    downloadKey: String,
     // R175 对调上右轨 → R201 分享枢纽：点按弹 ShareHubSheet 小菜单三选一
     //（复制链接/分享到其他应用/分享卡片；宿主 FeedScreen.onOpenShareHub 收口）
     onShare: () -> Unit,
@@ -128,7 +131,8 @@ internal fun BoxScope.VideoRightRail(
         ActionRail(
             liked = liked,
             favorited = favorited,
-            downloadStatus = downloadStatus,
+            downloads = downloads,
+            downloadKey = downloadKey,
             // R201 分享枢纽：点按弹小菜单三选一（链体在 FeedScreen 枢纽接线）；
             // 弹幕开关在长按面板
             onShare = onShare,

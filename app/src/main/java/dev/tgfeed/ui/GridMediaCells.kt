@@ -103,7 +103,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.State
 import androidx.compose.runtime.snapshots.Snapshot
+import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
@@ -202,7 +204,8 @@ internal fun GridPhotoCell(
     item: VideoItem,
     gateway: TdGateway,
     focused: Boolean,
-    liked: Boolean,
+    // R432 重组收敛：点赞表 State 本体下传，本格叶子内现查（订阅作用域=本格）
+    likes: State<Set<String>>,
     watched: Boolean,
     chromeless: Boolean,
     onFocus: () -> Unit,
@@ -210,6 +213,7 @@ internal fun GridPhotoCell(
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val liked = item.key in likes.value
     var playUri by remember(item.key) { mutableStateOf(item.playUri) }
     // 双击点赞飘心列表（与视频格同一套 HeartBurst）
     var hearts by remember(item.key) { mutableStateOf(listOf<HeartBurst>()) }
@@ -353,7 +357,8 @@ internal fun GridAudioCell(
     gateway: TdGateway,
     focused: Boolean,
     muteAll: Boolean,
-    liked: Boolean,
+    // R432 重组收敛：点赞表 State 本体下传，本格叶子内现查（订阅作用域=本格）
+    likes: State<Set<String>>,
     watched: Boolean,
     chromeless: Boolean,
     onFocus: () -> Unit,
@@ -369,6 +374,7 @@ internal fun GridAudioCell(
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val liked = item.key in likes.value
     val context = LocalContext.current
     // R80：自带地址先过收口判定（含 '#'/'?' 的裸路径置 null 走 ensurePlayable 换流地址）
     var playUri by remember(item.key) { mutableStateOf(item.safeInitialPlayUri()) }
@@ -632,11 +638,13 @@ internal fun GridCellDispatch(
     playerPool: PlayerPool,
     vm: FeedViewModel,
     focused: Boolean,
-    liked: Boolean,
-    favorited: Boolean,
+    // R432 重组收敛：三表 State 本体下传格叶子（叶子内按 item.key 现查），本分派层
+    // 与外层画布循环都不读表——下载 1Hz / 音量拖动不再触发全视口重组
+    likes: State<Set<String>>,
+    favorites: State<Set<String>>,
     watched: Boolean,
-    downloadStatus: DownloadStatus?,
-    volume: Float,
+    downloads: State<Map<String, DownloadStatus>>,
+    volumes: SnapshotStateMap<String, Float>,
     muteAll: Boolean,
     // R230 ⑥ 手动播放授权口（视频格：两步制第二步/失败重试；外层满 4 路 Toast 拒）
     onRequestPlay: () -> Boolean,
@@ -676,7 +684,7 @@ internal fun GridCellDispatch(
             item = item,
             gateway = gateway,
             focused = focused,
-            liked = liked,
+            likes = likes,
             watched = watched,
             chromeless = chromeless,
             onFocus = onFocus,
@@ -691,7 +699,7 @@ internal fun GridCellDispatch(
             gateway = gateway,
             focused = focused,
             muteAll = muteAll,
-            liked = liked,
+            likes = likes,
             watched = watched,
             chromeless = chromeless,
             onFocus = onFocus,
@@ -716,12 +724,12 @@ internal fun GridCellDispatch(
             playableOrdinal = playableOrdinal,
             poolEpoch = poolEpoch,
             focused = focused,
-            volume = volume,
+            volumes = volumes,
             muteAll = muteAll,
             onRequestPlay = onRequestPlay,
-            liked = liked,
-            favorited = favorited,
-            downloadStatus = downloadStatus,
+            likes = likes,
+            favorites = favorites,
+            downloads = downloads,
             watched = watched,
             chromeless = chromeless,
             gateway = gateway,

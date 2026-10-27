@@ -13,12 +13,18 @@ import org.json.JSONObject
  * R75-D：任何互动（含撤销）都刷新该频道的最后互动时刻——衰减基准随之重置。
  */
 internal fun FeedViewModel.addInteractionBoost(chatId: Long, delta: Double) {
-    val cur = interactionBoost[chatId] ?: 0.0
-    val next = (cur + delta).coerceIn(0.0, INTERACTION_BOOST_CAP)
-    if (next == cur) return // 无变化（已到顶/已回退到 0）不落盘
-    interactionBoost = interactionBoost + (chatId to next)
-    interactionBoostAt = interactionBoostAt + (chatId to System.currentTimeMillis())
-    viewModelScope.launch(Dispatchers.IO) { persistInteractionBoost() }
+    // R429：双 @Volatile Map 无锁 RMW 收进 synchronized 单函数——并发互动（点赞/收藏/
+    // 下载同拍落）读-算-写互踩丢更新；写点唯一（init 构造期加载为单线程），读方
+    // 仍吃不可变 Map 快照零改动
+    val changed = synchronized(this) {
+        val cur = interactionBoost[chatId] ?: 0.0
+        val next = (cur + delta).coerceIn(0.0, INTERACTION_BOOST_CAP)
+        if (next == cur) return@synchronized false // 无变化（已到顶/已回退到 0）不落盘
+        interactionBoost = interactionBoost + (chatId to next)
+        interactionBoostAt = interactionBoostAt + (chatId to System.currentTimeMillis())
+        true
+    }
+    if (changed) viewModelScope.launch(Dispatchers.IO) { persistInteractionBoost() }
 }
 
 /** 互动加分表落盘（新格式 {"v": 加分, "t": 最后互动时刻}）；IO 线程调用，失败静默 */

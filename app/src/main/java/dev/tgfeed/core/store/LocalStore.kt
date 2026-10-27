@@ -2,6 +2,9 @@ package dev.tgfeed.core.store
 
 import android.content.Context
 import dev.tgfeed.core.feed.ChannelCollection
+import dev.tgfeed.core.feed.PlayQueue
+import dev.tgfeed.core.feed.PlayQueueEntry
+import dev.tgfeed.core.feed.PlayQueueOrder
 import dev.tgfeed.core.td.VideoItem
 import org.json.JSONArray
 import org.json.JSONObject
@@ -46,6 +49,11 @@ import java.io.File
  *    顺序即创建顺序）；itemKeys 是条目清单的轻量镜像（计数/卡片展示免解析大文件）
  *  - playlist_<id>.json：每个片单一个文件，完整 VideoItem 数组（序列化规则同收藏），
  *    顺序即片单内连播顺序（追加在末尾）
+ *  - play_queue.json：播放队列（R387 节目单，一期=单队列实体）：
+ *    {name, orderMode, entries:[{type:"channel",id,chatId,title,skipped} |
+ *    {type:"item",id,item:完整VideoItem,skipped}], updatedAt, resumeEntryId, resumeKey}；
+ *    频道条目轻存 chatId+title（取数现拉），单条条目完整 VideoItem（同收藏 Codec，离线可播）；
+ *    队列级断点双字段（播到哪一条，开单跳回用）
  *  - discovery_candidates.json：发现页候选状态表（[DiscoveryCandidateState] 数组：
  *    软拒绝梯度 dismissCount/lastDismissTs（30 天 TTL，二次弃升级永久屏蔽）
  *    + 曝光计数 impressions + 漏斗归因 lastTasteTs/acceptedTs（DISCOVER-UPGRADE P1-a），
@@ -86,6 +94,8 @@ class LocalStore(context: Context) {
     private val watchLaterFile = File(dir, "watchlater.json")
     private val blockedChannelsFile = File(dir, "blocked_channels.json")
     private val dislikedFile = File(dir, "disliked.json")
+    // R413 关键词屏蔽：用户自定义屏蔽词（字符串数组；归一/去重由 KeywordMutePolicy 负责）
+    private val mutedKeywordsFile = File(dir, "muted_keywords.json")
     // 广告永久屏蔽：不感兴趣计数表（计数键→次数）+ 内容指纹永久屏蔽表
     private val dislikeCountFile = File(dir, "dislike_count.json")
     private val blockedItemsFile = File(dir, "blocked_items.json")
@@ -111,6 +121,7 @@ class LocalStore(context: Context) {
     @Volatile private var favoritesCache: List<VideoItem>? = null
     @Volatile private var watchLaterCache: List<VideoItem>? = null
     @Volatile private var blockedChannelsCache: Set<Long>? = null
+    @Volatile private var mutedKeywordsCache: Set<String>? = null
     @Volatile private var watchEventsCache: List<WatchEvent>? = null
     @Volatile private var likesCache: Set<String>? = null
     @Volatile private var dislikedCache: Set<String>? = null
@@ -233,6 +244,38 @@ class LocalStore(context: Context) {
         chatIds.forEach { arr.put(it) }
         writeText(blockedChannelsFile, arr.toString())
         blockedChannelsCache = chatIds
+    }
+
+    // ---------------- 关键词屏蔽（R413） ----------------
+
+    /** 读取用户屏蔽词集合（插入序）；文件不存在或损坏时返回空集合；缓存命中时不碰磁盘 */
+    @Synchronized
+    fun loadMutedKeywords(): Set<String> {
+        mutedKeywordsCache?.let { return it }
+        val text = readText(mutedKeywordsFile)
+        val set = if (text == null) {
+            emptySet()
+        } else {
+            runCatching {
+                val arr = JSONArray(text)
+                val out = LinkedHashSet<String>(arr.length())
+                for (i in 0 until arr.length()) {
+                    arr.optString(i).takeIf { it.isNotBlank() }?.let(out::add) // 坏条目跳过
+                }
+                out
+            }.getOrDefault(emptySet())
+        }
+        mutedKeywordsCache = set
+        return set
+    }
+
+    /** 全量覆盖写屏蔽词集合；写后重建缓存 */
+    @Synchronized
+    fun saveMutedKeywords(words: Set<String>) {
+        val arr = JSONArray()
+        words.forEach { arr.put(it) }
+        writeText(mutedKeywordsFile, arr.toString())
+        mutedKeywordsCache = words
     }
 
     // ---------------- 观看行为事件 ----------------
@@ -1608,6 +1651,203 @@ class LocalStore(context: Context) {
         listenQueueCache = items
     }
 
+    // ---------------- R387/R391 播放队列（节目单 → 播放台：多队列 v2 持久层） ----------------
+
+    private val playQueueFile = File(dir, "play_queue.json")
+
+    /**
+     * 播放台列表内存缓存（写时失效重建，与 listen_queue 同一模式；
+     * 唯一写入方=FeedPlayQueuePart/VM 串行通道）。R391 起存 [PlayStationsState]
+     * （台列表+活跃台 id）；一期单队列双函数（loadPlayQueue/savePlayQueue）已随
+     * v2 升格退役——同文件双 codec 双缓存会漂（旧路径误调写 v1 覆盖 v2=真风险），
+     * 判词见 r391_notes §2.2。
+     */
+    @Volatile private var playStationsCache: PlayStationsState? = null
+
+    /**
+     * 读取播放台列表（R391 v2 档：stations 数组+activeId）。
+     *
+     * 坏档防御沿用一期逐层口径：文件损坏/坏 JSON=空列表不崩溃（runCatching 兜底）；
+     * 台级防御：台对象非 JSONObject/id 空/entries 非 JSON=跳该台其余保留（收藏/
+     * 片单同口径，一台坏记录不拖垮整库）；条目级防御（id 缺失/type 未知/channel
+     * 条目 chatId=0/item 条目 VideoItem 坏）只跳该条；断点 NULL 哨兵 has+isNull
+     * 先守（Android org.json 对 NULL 值 optString 回字面 "null" 字符串，playUri
+     * 读侧 L923 同款判式）；orderMode 未知回落 MANUAL（单源反解）。
+     *
+     * **v1 迁移**（一期单队列实体→迁移台）：顶层有 "entries" 无 "stations" =
+     * 一期格式——整单解析为单台（id=legacy 固定串=重读幂等不漂移，名字/档位/
+     * 断点全继承），activeId=legacy；迁移在读侧发生（写侧只写 v2），旧装机首次
+     * 读即升级。activeId 失联（指向已删台）=null（调用方回落第一台）。
+     */
+    @Synchronized
+    fun loadPlayStations(): PlayStationsState {
+        playStationsCache?.let { return it }
+        val text = readText(playQueueFile)
+        val state = if (text == null) {
+            PlayStationsState(emptyList(), null)
+        } else {
+            runCatching {
+                val obj = JSONObject(text)
+                if (obj.has("stations")) parseStationsV2(obj) else parseStationV1(obj)
+            }.getOrDefault(PlayStationsState(emptyList(), null)) // 文件损坏时按空库处理，不崩溃
+        }
+        playStationsCache = state
+        return state
+    }
+
+    /** v2 档解析：stations 数组逐台防御 + activeId NULL 哨兵守 */
+    private fun parseStationsV2(obj: JSONObject): PlayStationsState {
+        val arr = obj.optJSONArray("stations")
+        val stations = ArrayList<PlayQueue>(arr?.length() ?: 0)
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val s = arr.optJSONObject(i) ?: continue
+                val id = s.optString("id")
+                if (id.isEmpty()) continue // 台身份是主键，缺失即坏台（同条目 id 口径）
+                val (resumeEntryId, resumeKey) = parseResume(s)
+                stations += PlayQueue(
+                    id = id,
+                    name = s.optString("name").ifBlank { PlayQueue.DEFAULT_NAME },
+                    orderMode = PlayQueueOrder.fromName(s.optString("orderMode")),
+                    entries = parseEntries(s.optJSONArray("entries")),
+                    updatedAt = s.optLong("updatedAt", 0L),
+                    resumeEntryId = resumeEntryId,
+                    resumeKey = resumeKey,
+                    chainTo = parseChainTo(s),
+                )
+            }
+        }
+        // R402 毒态自愈守门：历史缺陷（生成覆盖分支同 id 双插）曾落重复条 →
+        // 启动即 LazyColumn 重复 key 崩溃循环。读侧按 id 去重（保留位序最前条）
+        // ——毒机免数据手术自恢复；正常档零变化（id 本是主键唯一）。
+        val deduped = stations.toList().distinctBy { it.id }
+        val activeId = if (obj.has("activeId") && !obj.isNull("activeId"))
+            obj.optString("activeId").ifBlank { null } else null
+        return PlayStationsState(deduped, activeId)
+    }
+
+    /** v1 档解析（一期单队列→迁移台）：顶层 entries/name/orderMode/断点全继承 */
+    private fun parseStationV1(obj: JSONObject): PlayStationsState {
+        val (resumeEntryId, resumeKey) = parseResume(obj)
+        val station = PlayQueue(
+            id = PlayQueue.LEGACY_ID,
+            name = obj.optString("name").ifBlank { PlayQueue.DEFAULT_NAME },
+            orderMode = PlayQueueOrder.fromName(obj.optString("orderMode")),
+            entries = parseEntries(obj.optJSONArray("entries")),
+            updatedAt = obj.optLong("updatedAt", 0L),
+            resumeEntryId = resumeEntryId,
+            resumeKey = resumeKey,
+        )
+        return PlayStationsState(listOf(station), PlayQueue.LEGACY_ID)
+    }
+
+    /**
+     * 条目数组解析（v1/v2 共用，一期逐条防御口径原样沿续）：
+     * id 缺失/type 未知/channel 条目 chatId=0/item 条目 VideoItem 坏——只跳该条
+     * 其余保留（一条坏记录不拖垮整单）。
+     */
+    private fun parseEntries(entriesArr: JSONArray?): List<PlayQueueEntry> {
+        val entries = ArrayList<PlayQueueEntry>(entriesArr?.length() ?: 0)
+        if (entriesArr != null) {
+            for (i in 0 until entriesArr.length()) {
+                val e = entriesArr.optJSONObject(i) ?: continue
+                val id = e.optString("id")
+                if (id.isEmpty()) continue // 坏条目跳过（同片单 id/name 缺失口径）
+                val skipped = e.optBoolean("skipped", false)
+                when (e.optString("type")) {
+                    "channel" -> {
+                        val chatId = e.optLong("chatId", 0L)
+                        if (chatId == 0L) continue // chatId 是频道段命根，缺失即坏条目
+                        entries += PlayQueueEntry.Channel(
+                            id = id,
+                            chatId = chatId,
+                            title = e.optString("title"),
+                            skipped = skipped,
+                        )
+                    }
+                    "item" -> {
+                        val itemObj = e.optJSONObject("item") ?: continue
+                        // VideoItem 单条字段缺失/类型错（toVideoItem 的 getString 会抛）
+                        // 只跳该条（同收藏/片单/听单逐条防御）
+                        runCatching {
+                            entries += PlayQueueEntry.Item(id, itemObj.toVideoItem(), skipped)
+                        }
+                    }
+                    // 未知 type（未来版本条目）：跳过不炸整单（读侧前向兼容）
+                }
+            }
+        }
+        return entries
+    }
+
+    /** 断点双字段解析（v1 顶层/v2 台对象共用）：缺失/NULL 哨兵/空串一律回落 null（从头播语义） */
+    private fun parseResume(obj: JSONObject): Pair<String?, String?> {
+        val resumeEntryId = if (obj.has("resumeEntryId") && !obj.isNull("resumeEntryId"))
+            obj.optString("resumeEntryId").ifBlank { null } else null
+        val resumeKey = if (obj.has("resumeKey") && !obj.isNull("resumeKey"))
+            obj.optString("resumeKey").ifBlank { null } else null
+        return resumeEntryId to resumeKey
+    }
+
+    /**
+     * 接棒台解析(R392 #5 增量字段,parseResume 同款 NULL 哨兵口径):缺失/NULL
+     * 哨兵/空串一律回落 null(=不接,向后兼容:旧档无键→不接);v1 段不读
+     * (parseStationV1 冻结零改——一期档无接棒概念,迁移台恒不接合法)。
+     */
+    private fun parseChainTo(obj: JSONObject): String? =
+        if (obj.has("chainTo") && !obj.isNull("chainTo"))
+            obj.optString("chainTo").ifBlank { null } else null
+
+    /**
+     * 全量覆盖写播放台列表（调用方=FeedPlayQueuePart 已在模型内维护好各台顺序与
+     * 200 截尾；只写 v2——迁移在读侧发生）；写后重建缓存。
+     */
+    @Synchronized
+    fun savePlayStations(state: PlayStationsState) {
+        val obj = JSONObject().apply {
+            put("v", 2)
+            put("activeId", state.activeId ?: JSONObject.NULL)
+            put("stations", JSONArray().apply {
+                state.stations.forEach { q ->
+                    put(stationJson(q))
+                }
+            })
+        }
+        writeText(playQueueFile, obj.toString())
+        playStationsCache = state
+    }
+
+    /** 单台 JSON（v2 stations 数组元素；entries 写法与一期逐字段对称） */
+    private fun stationJson(q: PlayQueue): JSONObject = JSONObject().apply {
+        put("id", q.id)
+        put("name", q.name)
+        put("orderMode", q.orderMode.name)
+        put("entries", JSONArray().apply {
+            q.entries.forEach { e ->
+                put(JSONObject().apply {
+                    put("id", e.id)
+                    put("skipped", e.skipped)
+                    when (e) {
+                        is PlayQueueEntry.Channel -> {
+                            put("type", "channel")
+                            put("chatId", e.chatId)
+                            put("title", e.title)
+                        }
+                        is PlayQueueEntry.Item -> {
+                            put("type", "item")
+                            put("item", e.item.toJson())
+                        }
+                    }
+                })
+            }
+        })
+        put("updatedAt", q.updatedAt)
+        put("resumeEntryId", q.resumeEntryId ?: JSONObject.NULL)
+        put("resumeKey", q.resumeKey ?: JSONObject.NULL)
+        // R392 #5 接棒台三态落盘(null=不接/next 哨兵=下一台/指定台 id)
+        put("chainTo", q.chainTo ?: JSONObject.NULL)
+    }
+
     // ---------------- 分屏画布记忆（GAPS3 #8） ----------------
 
     private val gridCanvasFile = File(dir, "grid_canvas.json")
@@ -2162,6 +2402,16 @@ data class WatchEvent(
     val watchSec: Int,
     val durationSec: Int,
     val ts: Long,
+)
+
+/**
+ * 播放台列表快照（R391 多队列 v2 档的 store 层持久化模型，play_queue.json）：
+ * stations = 全部播放台（顺序即持久化序）；activeId = 活跃台 id
+ * （null=无活跃台；失联=指向已删台时调用方回落第一台）。
+ */
+data class PlayStationsState(
+    val stations: List<PlayQueue>,
+    val activeId: String?,
 )
 
 /**

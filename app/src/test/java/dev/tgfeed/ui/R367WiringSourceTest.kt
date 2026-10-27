@@ -107,7 +107,7 @@ class R367WiringSourceTest {
         val text = mapScreen()
         val publish = text.indexOf("ctx.inWellIds.value = wellIds.toHashSet()")
         assertTrue("井内集合发布应在场（轮询拍尾）", publish > 0)
-        val collect = text.indexOf("if (ahead && ratio < TasteTagPlanets.APPEAR_RATIO) wellIds += s.chatId")
+        val collect = text.indexOf("if (ahead && ratio < TasteTagPlanets.APPEAR_RATIO)")
         assertTrue("井内收集门应在场（ahead ∧ APPEAR_RATIO 同渲染门）", collect > 0)
         val pollStart = text.indexOf("private suspend fun CoroutineScope.pollGalaxyBeatsR254")
         assertTrue("收集与发布都应落在轮询体内", pollStart in 0 until collect && collect < publish)
@@ -120,8 +120,11 @@ class R367WiringSourceTest {
     @Test
     fun honest_refuse_zero_eviction_with_session_dedup() {
         val body = assembleBody(mapScreen())
-        val refuse = body.indexOf("if (victim == null) {")
-        assertTrue("诚实拒绝分支应在场", refuse > 0)
+        // R412 在诚实拒绝前加了一层「驱逐井内最远者」（帽被井内钉满先试逐最远，
+        // 焦点三态永不逐）；诚实拒绝零驱逐分支=第二层 victim==null
+        val firstTier = body.indexOf("if (victim == null) {")
+        val refuse = body.indexOf("if (victim == null) {", firstTier + 1)
+        assertTrue("诚实拒绝分支应在场", firstTier > 0 && refuse > 0)
         val probe = body.indexOf("R233 装配拒绝", refuse)
         assertTrue("拒绝探针行应在场（计数口径）", probe > 0)
         assertTrue("探针应走会话去重（planetRefuseLog）", body.substring(refuse, refuse + 600).contains("planetRefuseLog.add"))

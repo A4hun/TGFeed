@@ -491,7 +491,14 @@ internal suspend fun TdLibGateway.resolveLiveAnswerItemsImpl(links: List<String>
         Log.w(TAG, "resolveLiveAnswerItems: 秒回预算耗尽，本批 ${links.size} 条未尝试（下轮可重试）")
         return null
     }
-    awaitAuthorized()
+    // R429：授权超时不再裸抛崩进程——awaitAuthorized 超时抛 IllegalStateException，会穿透
+    // 调用方的 fire-and-forget 解析协程；按「未尝试」口径收场（null 与预算耗尽同语义，
+    // 调用方不进死信、下轮可重试）。CancellationException（协程取消）必须原样上抛
+    runCatching { awaitAuthorized() }.onFailure {
+        if (it is kotlinx.coroutines.CancellationException) throw it
+        Log.w(TAG, "resolveLiveAnswerItems: 授权超时，本批 ${links.size} 条未尝试（下轮可重试）")
+        return null
+    }
     val r = resolveLinksToItems(links)
     Log.i(TAG, "resolveLiveAnswerItems: 请求 ${links.size} 条，解析出 ${r.size} 条（秒回预算剩=${liveAskBudget.remaining()}）")
     return r
@@ -509,7 +516,13 @@ internal suspend fun TdLibGateway.resolveGroupAnswerItemsImpl(links: List<String
         Log.w(TAG, "resolveGroupAnswerItems: 查询预算耗尽，本批 ${links.size} 条未尝试（下轮可重试）")
         return null
     }
-    awaitAuthorized()
+    // R429：授权超时不再裸抛崩进程（同 resolveLiveAnswerItems 口径）——超时按「未尝试」
+    // 返回 null（与查询预算耗尽同语义，调用方放词闸下轮重试）；CancellationException 原样上抛
+    runCatching { awaitAuthorized() }.onFailure {
+        if (it is kotlinx.coroutines.CancellationException) throw it
+        Log.w(TAG, "resolveGroupAnswerItems: 授权超时，本批 ${links.size} 条未尝试（下轮可重试）")
+        return null
+    }
     val r = resolveLinksToItems(links)
     Log.i(TAG, "resolveGroupAnswerItems: 请求 ${links.size} 条，解析出 ${r.size} 条")
     return r
@@ -609,7 +622,13 @@ internal suspend fun TdLibGateway.resolveAnswerTitlesImpl(usernames: List<String
             return null
         }
     }
-    awaitAuthorized()
+    // R429：授权超时不再裸抛崩进程（与秒回/历史区内容卡同口径）——超时按「未尝试」
+    // 返回 null（调用方放词闸下轮重试，不烧死信）；CancellationException 原样上抛
+    runCatching { awaitAuthorized() }.onFailure {
+        if (it is kotlinx.coroutines.CancellationException) throw it
+        Log.w(TAG, "resolveAnswerTitles: 授权超时，本批 ${todo.size} 个未尝试（下轮可重试）")
+        return null
+    }
     // 3 路并发（与答案区 eager 解析同口径）：上限提到 12 后串行会让整批标题等 12×单条耗时，
     // 秒回区"等待应答"尾巴拖长；并发后单批耗时 ≈ 4×单条，flood 风险不变（同批总量不变）
     val out = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, String>>()

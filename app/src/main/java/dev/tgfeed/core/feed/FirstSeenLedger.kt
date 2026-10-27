@@ -10,13 +10,13 @@ import java.io.File
  * 同一 fileUniqueId 跨频道副本的**最早出现**=首发（真·上游，关注它=永远比搬运号快半拍）。
  *
  * 查询纪律（R183 LIKE 全表扫的同族红线）：
- *  - fileUniqueId **不在任何索引**（仅 idx_items_chat_msg/album）——`WHERE fileUniqueId=?`
- *    是全表扫（4M 行秒级~十秒级），**绝不自动触发**：入口是用户主动点按「首发溯源」
- *    （WK-1 考古学家先例：点按付费，零被动成本），只读连接 + 后台协程 + 单飞闸；
+ *  - R266 v11 起双臂走 idx_items_fuid / idx_refs_fuid（毫秒级点查）；R428 加
+ *    [fuidIndexReady] 就绪门——索引未建成的升级窗口期**绝不回退全表扫**
+ *    （`WHERE fileUniqueId=?` 无索引即 4M 行秒级~十秒级，同族红线），未就绪
+ *    返回 null 占位。入口仍是用户主动点按「首发溯源」（WK-1 考古学家先例：
+ *    点按付费，零被动成本），只读连接 + 后台协程 + 单飞闸；
  *  - 结果进磁盘账本 [LEDGER_FILE]（LRU 封顶 [MAX_ENTRIES]，门房辖区外的 files 根）：
- *    同一指纹第二次查看零成本；会话内存缓存先行，账本兜跨会话；
- *  - R202 索引侧（idx_items_fingerprint/date）落地后此查询可升级索引序毫秒级、
- *    徽章可自动化（见 r204_notes 挂账）——本轮先把用户面与账本铺好，查询体一行可换。
+ *    同一指纹第二次查看零成本；会话内存缓存先行，账本兜跨会话。
  *
  * 覆盖诚实口径：只看得见**本地深索引已收录**的频道（订阅/金矿宇宙）；索引外的搬运
  * 频道不可见，判定文案如实标注「基于本地深索引检索」。
@@ -58,7 +58,9 @@ object FirstSeenLedger {
      *
      * R266 v11 双臂（顺带根治既有全表扫慢性病）：items 臂走 idx_items_fuid +
      * refs 臂走 idx_refs_fuid，**毫秒级**（v11 前的全表扫 4M 行秒级~十秒级成为
-     * 历史；索引未建成的升级窗口期自然回退全表扫——用户点按触发，语义不变）。
+     * 历史）。R428 就绪门：索引未建成的升级窗口期**不再回退全表扫**——调用方
+     * 传 [fuidIndexReady]（DeepSearchIndex.fuidIndexReadyCached，IndexImportMerge
+     * 同款红线「指纹索引未就绪绝不按 fuid 查库」），未就绪直接返回 null 占位。
      * 副本清单 = 1 canonical + N refs（合并后 items 同指纹恒一行）。
      */
     fun query(
@@ -66,9 +68,15 @@ object FirstSeenLedger {
         fileUniqueId: String,
         currentChatId: Long,
         currentMessageId: Long,
+        fuidIndexReady: Boolean,
         nowMs: Long = System.currentTimeMillis(),
     ): Verdict? {
         if (fileUniqueId.isBlank()) return null
+        // R428 就绪门（InterlinkMerge/IndexImportMerge 同款接法）：未就绪绝不放行——
+        // WHERE fileUniqueId=? 无索引即全表扫（4M 行秒级~十秒级）。返回 null =
+        // Verdict? 的安全默认（无判定，调用方落诚实空态）；索引建成后（openDb
+        // 后台分钟级一次性工程）重查/「重新查证」即得真判定。
+        if (!fuidIndexReady) return null
         val copies = ArrayList<Copy>(8)
         runCatching {
             db.rawQuery(

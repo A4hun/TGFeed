@@ -10,8 +10,7 @@ import java.util.concurrent.ConcurrentHashMap
 // ---------------- R204 DS-5 首发溯源（同 fileUniqueId 跨频道最早出现，数据侧） ----------------
 
 /**
- * 首发溯源数据口：用户点按才触发（[FirstSeenLedger.query] 是全表扫——WK-1 考古学家
- * 先例「点按付费」，零被动成本）。
+ * 首发溯源数据口：用户点按才触发（WK-1 考古学家先例「点按付费」，零被动成本）。
  *  - 三级缓存：会话内存 → 磁盘账本（跨会话，LRU 512）→ 全表扫（扫完回写账本）；
  *  - [firstSeenLock] 串行化并发查证（第二个同指纹调用等锁后走内存命中，不重复扫）；
  *  - [FirstSeenOutcome] 三态：NotApplicable（Mock/本地文件无指纹）/ Missed（索引内
@@ -50,12 +49,17 @@ internal fun FeedViewModel.firstSeenImpl(
             return FirstSeenOutcome.Found(it)
         }
     }
-    // ③ 全表扫（只读连接；4M 行秒级~十秒级——用户点按时已知成本，UI 转圈承接）
+    // ③ 索引序点查（只读连接；v11 起走 idx_items_fuid/idx_refs_fuid 毫秒级。
+    // R428 就绪门：指纹索引未就绪（升级窗口期后台在建）query 直接返回 null 落
+    // Missed——绝不回退全表扫（4M 行秒级~十秒级），索引建成后重查/重新查证即得真判定）
     val dbFile = tierDbFile()
     if (!dbFile.exists()) return FirstSeenOutcome.Missed
     val outcome: FirstSeenOutcome = runCatching {
         SQLiteDatabase.openDatabase(dbFile.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { d ->
-            val v = FirstSeenLedger.query(d, fp, item.chatId, item.messageId)
+            val v = FirstSeenLedger.query(
+                d, fp, item.chatId, item.messageId,
+                fuidIndexReady = deepIndex.fuidIndexReadyCached(d),
+            )
             if (v == null) FirstSeenOutcome.Missed else FirstSeenOutcome.Found(v)
         }
     }.getOrElse {

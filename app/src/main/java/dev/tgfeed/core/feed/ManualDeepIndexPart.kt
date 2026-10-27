@@ -114,17 +114,15 @@ internal fun FeedViewModel.requestDeepIndexImpl(chatId: Long) {
             "FeedViewModel",
             "R191 手动钉住深索引：chatId=$chatId（钉住集合 ${pinned.size} 个）→ T0 等待遇，自动评估不降档",
         )
+        // R419：先进手动车道（插到最前；独立派工槽真插队，不等巡游槽空出、不受时机/风暴闸）——
+        // 先于档位评估入队：评估 urgent 走优先车道时 dispatchCrawl 也会认出这是手动频道
+        if (indexSchedulerAlive) indexPipeline.manualLane.request(chatId)
         // 档位 T0 落库（评估钉住分支直通；升档 urgent 的优先插队在评估内已做）
         runCatching { evaluateAndSetTierImpl(chatId) }
-        // 立即建库：优先车道（预算内插队）或直接建库（调度器没跑）
-        if (indexSchedulerAlive) {
-            enqueuePriorityCrawlImpl(chatId)
-        } else {
-            runCatching {
-                deepIndex.indexChannel(gateway, chatId, tiering = indexTiering) { n ->
-                    onManualIndexRowProgressImpl(chatId, n)
-                }
-            }.onFailure { _error.value = "深度索引构建失败：${it.message}" }
+        // 立即建库：手动车道（上方已入队）或直接建库（调度器没跑）
+        if (!indexSchedulerAlive) {
+            // R419：直接建库同样走看护层（停滞/硬上限超时必返回，行状态不会永久 building）
+            guardedIndexChannelImpl(chatId, manual = true, scope = viewModelScope)
             onManualIndexRowFinishedImpl(chatId)
         }
     }
@@ -145,6 +143,10 @@ internal fun FeedViewModel.cancelDeepIndexPinImpl(chatId: Long) {
         rows + (chatId to next)
     }
     viewModelScope.launch(Dispatchers.IO) {
+        // R419：未起跑的手动排队一并撤销；撤的是排队态（不在爬）→ 行台账随之回收（防永久 building）
+        if (indexPipeline.manualLane.forget(chatId)) {
+            _manualIndexRows.update { rows -> rows[chatId]?.takeIf { !it.pinned }?.let { rows - chatId } ?: rows }
+        }
         val pinned = manualPinMutex.withLock {
             val next = prefs.deepIndexPinnedChatIds - chatId
             runCatching { prefs.deepIndexPinnedChatIds = next }

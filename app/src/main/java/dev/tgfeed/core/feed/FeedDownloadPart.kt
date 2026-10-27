@@ -29,8 +29,14 @@ import java.net.URL
  * 状态照常回报 Running / Done(展示路径) / Failed。
  */
 internal fun FeedViewModel.downloadImpl(item: VideoItem) {
+    // R429：跨协程 RMW 全部改 _downloads.update{} 单表达式 CAS——旧版「读-改-写」三步
+    // 在轮询/下载/删除协程并发时会互相丢写（poller 把 Done 盖回 Running 的根因）；
+    // 前置检查只是快速出口，写入一律经 update 在 CAS 内复核
     if (_downloads.value[item.key] is DownloadStatus.Running) return
-    _downloads.value = _downloads.value + (item.key to DownloadStatus.Running())
+    _downloads.update { m ->
+        if (m[item.key] is DownloadStatus.Running) m
+        else m + (item.key to DownloadStatus.Running())
+    }
     viewModelScope.launch(Dispatchers.IO) {
         // 进度轮询协程：Running 期间每秒查一次 TDLib 文件进度并写回 _downloads。
         // 仅对有真实 TDLib fileId 的条目启动；Mock（fileId=-1）无文件可查，跳过。
@@ -47,8 +53,10 @@ internal fun FeedViewModel.downloadImpl(item: VideoItem) {
                     // 只在仍处于 Running 时写回，避免覆盖终态（Done/Failed）；
                     // 状态已迁走说明下载流程已收尾，轮询随之退出
                     if (_downloads.value[item.key] !is DownloadStatus.Running) break
-                    _downloads.value =
-                        _downloads.value + (item.key to DownloadStatus.Running(p))
+                    _downloads.update { m ->
+                        if (m[item.key] is DownloadStatus.Running) m + (item.key to DownloadStatus.Running(p))
+                        else m // CAS 内复核已迁终态：本轮不写（不把 Done 盖回 Running）
+                    }
                     delay(PROGRESS_POLL_MS)
                 }
             }
@@ -90,10 +98,12 @@ internal fun FeedViewModel.downloadImpl(item: VideoItem) {
             runCatching { store.addDownload(record) }
                 .onFailure { _error.value = "下载记录保存失败：${it.message}" }
         }
-        _downloads.value = _downloads.value + (item.key to result.fold(
-            onSuccess = { DownloadStatus.Done(it) },
-            onFailure = { DownloadStatus.Failed(it.message ?: "下载失败") },
-        ))
+        _downloads.update { m ->
+            m + (item.key to result.fold(
+                onSuccess = { DownloadStatus.Done(it) },
+                onFailure = { DownloadStatus.Failed(it.message ?: "下载失败") },
+            ))
+        }
     }
 }
 
@@ -233,8 +243,9 @@ internal fun FeedViewModel.removeDownloadImpl(key: String) {
         val removed = runCatching { store.removeDownload(key) }.getOrNull() ?: return@launch
         _downloadRecords.value = _downloadRecords.value.filterNot { it.key == key }
         deleteDownloadedFile(removed.path)
-        if (_downloads.value[key] is DownloadStatus.Done) {
-            _downloads.value = _downloads.value - key
+        // R429：Done 态清理改 update{} CAS——条件判定与写入原子化，不与下载终态写互踩
+        _downloads.update { m ->
+            if (m[key] is DownloadStatus.Done) m - key else m
         }
     }
 }
@@ -254,9 +265,12 @@ internal fun FeedViewModel.removeDownloadsImpl(keys: Set<String>) {
         }
         _downloadRecords.value = _downloadRecords.value.filterNot { it.key in keys }
         removedPaths.forEach { deleteDownloadedFile(it) }
-        // 操作栏 Done 态一次清理（逐条改会触发多次重组）
-        val doneKeys = keys.filter { _downloads.value[it] is DownloadStatus.Done }
-        if (doneKeys.isNotEmpty()) _downloads.value = _downloads.value - doneKeys.toSet()
+        // 操作栏 Done 态一次清理（逐条改会触发多次重组）；R429 改 update{} CAS：
+        // 筛选与写入原子化（同上 removeDownloadImpl 口径）
+        _downloads.update { m ->
+            val doneKeys = keys.filter { m[it] is DownloadStatus.Done }
+            if (doneKeys.isEmpty()) m else m - doneKeys.toSet()
+        }
     }
 }
 

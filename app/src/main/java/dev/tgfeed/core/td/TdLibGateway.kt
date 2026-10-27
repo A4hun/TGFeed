@@ -227,6 +227,28 @@ private const val CHAT_STORIES_REFRESH_CONCURRENCY = 8
 /** 快拍快照单频道查询超时：正常毫秒级；TDLib 拥塞排队时按超时弃权（该频道本轮无快拍，更新流会补） */
 private const val CHAT_STORIES_PER_CALL_TIMEOUT_MS = 5_000L
 
+/**
+ * 频道头像缓存上限（条，R428）：单条小图字节 ≈10-50KB，256 条 ≈几到十几 MB 量级——
+ * 覆盖"抽屉+订阅页全量频道"的回访窗口，淘汰后走 TDLib 秒级重拉，用户无感。
+ * 家族口径：msgCoverMemCache 256 条（ByteArray）同档。
+ */
+internal const val CHANNEL_AVATAR_CACHE_MAX = 256
+
+/**
+ * 搜索机器人结果缓存上限（页，R428）：value 是整页 List<VideoItem>（数十条、
+ * 每条含标题/链接/封面引用），单页内存远大于头像字节条目；32 页覆盖一轮会话内
+ * 反复重搜的高频词窗口，淘汰后重问机器人（有 429 熔断护栏）用户无感。
+ * TTL（BOT_CACHE_TTL_MS 10 分钟）语义归 GatewayBotSearch，本上限只管容量。
+ */
+internal const val SEARCH_BOT_CACHE_MAX = 32
+
+/**
+ * 评论缓存上限（条，R428）：commentsCache（纯文本）与 commentsRichCache（弹幕）
+ * 同口径同语义、各自独立收编不合并。单条是一支视频的全量评论文本（数十到数百条），
+ * 64 条覆盖"最近播放窗口 + 回访"，淘汰后重拉一次，弹幕本就是锦上添花，无感。
+ */
+internal const val COMMENTS_CACHE_MAX = 64
+
 class TdLibGateway(
     context: Context,
     internal val scope: CoroutineScope,
@@ -1225,11 +1247,12 @@ class TdLibGateway(
     // ---------------- 频道头像 ----------------
 
     /**
-     * 频道头像进程内缓存：chatId → 图片字节。
-     * 头像不常变，进程内缓存即可；用 ConcurrentHashMap 是因为本方法会被
-     * UI 层多行并发调用（LazyColumn 每行一个 LaunchedEffect）。
+     * 频道头像进程内缓存：chatId → 图片字节（上限与淘汰论证见 [CHANNEL_AVATAR_CACHE_MAX]）。
+     * 头像不常变，进程内缓存即可；本方法会被 UI 层多行并发调用
+     * （LazyColumn 每行一个 LaunchedEffect），BoundedLruCache 读写全经
+     * 内部锁，并发语义与原 ConcurrentHashMap 等价；R428 自无界表收编。
      */
-    internal val channelAvatarCache = java.util.concurrent.ConcurrentHashMap<Long, ByteArray>()
+    internal val channelAvatarCache = BoundedLruCache<Long, ByteArray>(CHANNEL_AVATAR_CACHE_MAX)
 
     /**
      * 取频道真头像（小图）的字节；无头像或任何一步失败返回 null（调用方回落字母头像）。
@@ -1521,11 +1544,15 @@ class TdLibGateway(
 
     /**
      * 搜索机器人结果进程内缓存：key = "主机器人:关键词"（均 trim + 小写），value = 写入时间戳 to 结果。
-     * TTL 10 分钟（BOT_CACHE_TTL_MS），命中直接返回、不再问机器人。
+     * TTL 10 分钟（BOT_CACHE_TTL_MS），命中直接返回、不再问机器人；过期条目由
+     * GatewayBotSearch 命中时顺手 remove（TTL 语义照旧，R428 只收容量）。
      * 只缓存非空结果——空结果多半是机器人临时不可用/超时，缓存会挡住用户立即重试。
-     * ConcurrentHashMap：searchViaBot 可能被 UI 多入口并发触发。
+     * R428 自无界 ConcurrentHashMap 收编：整页 List<VideoItem> 价值高但单条大，
+     * 32 页覆盖"一轮会话内反复重搜的高频词"，淘汰后重问机器人无感；
+     * searchViaBot 会被 UI 多入口并发触发，BoundedLruCache 读写全经内部锁，
+     * 并发语义与原表等价。
      */
-    internal val searchBotCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<VideoItem>>>()
+    internal val searchBotCache = BoundedLruCache<String, Pair<Long, List<VideoItem>>>(SEARCH_BOT_CACHE_MAX)
 
     // ---------------- 资源搜索群收割支撑（GroupHarvester P0/P1，全程只读） ----------------
 
@@ -1736,9 +1763,10 @@ class TdLibGateway(
     /**
      * 评论纯文本缓存：key = VideoItem.key（含 chatId，防跨频道 messageId 撞号）。
      * 只缓存成功结果（含"确认无评论"的空表）；网络类失败不缓存，下次调用可重试。
-     * 弹幕是锦上添花，不追求实时性，进程内缓存即可。
+     * 弹幕是锦上添花，不追求实时性，进程内缓存即可；R428 自无界表收编为
+     * 有界（[COMMENTS_CACHE_MAX]），淘汰后重拉一次即可，用户无感。
      */
-    internal val commentsCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+    internal val commentsCache = BoundedLruCache<String, List<String>>(COMMENTS_CACHE_MAX)
 
     // ---- 资源群答案/秒问联动公共 API 委托（实现见 GatewayLiveSearch.kt） ----
     fun recordGroupSearchLink(fromChatId: Long, link: String) = recordGroupSearchLinkImpl(fromChatId, link)
@@ -2668,8 +2696,10 @@ class TdLibGateway(
 
     // ---------------- 频道评论（弹幕数据源·"问出处"上下文增强版） ----------------
 
-    /** getCommentsRich 结果进程内缓存：key = VideoItem.key（与 commentsCache 同口径同语义） */
-    internal val commentsRichCache = java.util.concurrent.ConcurrentHashMap<String, List<DanmakuItem>>()
+    /** getCommentsRich 结果进程内缓存：key = VideoItem.key（与 commentsCache 同口径同语义）。
+     *  R428 与 commentsCache 各自收编为有界（[COMMENTS_CACHE_MAX]，不合并降低风险），
+     *  读写点 GatewayComments 全是 ?.let 判空 + 方括号写入，operator 语法零改动。 */
+    internal val commentsRichCache = BoundedLruCache<String, List<DanmakuItem>>(COMMENTS_CACHE_MAX)
 
     /** 消息封面内存缓存：LinkedHashMap 访问序 LRU，上限 [MSG_COVER_MEM_MAX] 条；全部读写经 synchronized 保护 */
     internal val msgCoverMemCache = object : LinkedHashMap<String, ByteArray>(64, 0.75f, true) {

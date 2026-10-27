@@ -23,6 +23,21 @@ object ColdStartProbe {
     fun mark(node: String) {
         if (t0 == 0L) t0 = SystemClock.elapsedRealtime()
         val delta = SystemClock.elapsedRealtime() - t0
-        DiagLog.log("ColdStart", "+${delta}ms $node")
+        DiagLog.log("ColdStart", "+${delta}ms ${node}")
+    }
+
+    /** R421 计时探针 logcat Tag（只输出固定阶段名 + 毫秒，零业务内容） */
+    private const val R421_TAG = "R421Start"
+
+    /**
+     * R421 启动阶段计时：直写 logcat（不经 DiagLog 落盘，零 IO），输出
+     * 「阶段 距进程创建毫秒」。进程创建时刻取 Process.getStartElapsedRealtime
+     * （fork 时刻，含 Application 构造前的类加载开销）。[stage] 只许传固定英文阶段名。
+     */
+    fun r421(stage: String) {
+        runCatching {
+            val ms = SystemClock.elapsedRealtime() - android.os.Process.getStartElapsedRealtime()
+            android.util.Log.i(R421_TAG, "${stage} ${ms}")
+        }
     }
 }

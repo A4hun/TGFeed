@@ -63,6 +63,13 @@ class WebPreviewResolver(
         private const val DEFAULT_MUTE_SEC = 60
 
         /**
+         * 成功缓存与死信表的条数上限（R428）：原本两张无界表随会话只增不减
+         * （R165 灾变链燃料族）；512 条覆盖一轮会话的预览解析窗口，成功缓存
+         * 淘汰后重拉一次、死信淘汰后重探一次（404 复验安全，仅多一请求），均无感。
+         */
+        private const val CACHE_MAX = 512
+
+        /**
          * og:description 成员数文案（R48）："12,345 members"/"6.7K subscribers"形态，
          * 英文逗号分隔数字去逗号；k/K=×1000、M=×1,000,000 取整（预览页体量缩写口径）。
          */
@@ -72,11 +79,15 @@ class WebPreviewResolver(
         )
     }
 
-    /** 成功结果进程内缓存：小写用户名 → 频道名+成员数（只存成功） */
-    private val cache = ConcurrentHashMap<String, WebChannelInfo>()
+    /** 成功结果进程内缓存：小写用户名 → 频道名+成员数（只存成功）；R428 收编为有界（[CACHE_MAX]） */
+    private val cache = BoundedLruCache<String, WebChannelInfo>(CACHE_MAX)
 
-    /** 永久死信：预览页实证用户名不存在（页面无 og:title / 含 tgme_page_extra 提示），本进程不再重试 */
-    private val dead = ConcurrentHashMap.newKeySet<String>()
+    /**
+     * 永久死信：预览页实证用户名不存在（页面无 og:title / 含 tgme_page_extra 提示），
+     * 本进程不再重试；R428 收编为有界（[CACHE_MAX]）——被淘汰的最久未探死信会
+     * 被重探一次，404 复验安全（仅多一请求）。值恒为 Unit，仅当集合用。
+     */
+    private val dead = BoundedLruCache<String, Unit>(CACHE_MAX)
 
     /** 同用户名 in-flight 单飞表：并发调用搭车等待同一请求，绝不重复发 */
     private val inFlight = ConcurrentHashMap<String, CompletableDeferred<WebChannelInfo?>>()
@@ -91,7 +102,7 @@ class WebPreviewResolver(
      */
     suspend fun resolveTitles(usernames: List<String>): Map<String, WebChannelInfo> {
         val names = usernames.map { it.trim().removePrefix("@").lowercase() }
-            .filter { it.isNotEmpty() && it !in dead }
+            .filter { it.isNotEmpty() && dead[it] == null }
             .distinct().take(MAX_PER_BATCH)
         if (names.isEmpty()) return emptyMap()
         val out = ConcurrentHashMap<String, WebChannelInfo>()
@@ -164,7 +175,7 @@ class WebPreviewResolver(
                     return null
                 }
                 404 -> {
-                    dead += name
+                    dead[name] = Unit
                     Log.d(TAG, "webTitles: @$name notFound（HTTP 404），进死信")
                     return null
                 }
@@ -189,7 +200,7 @@ class WebPreviewResolver(
             // 用户名不存在判定：页面无 og:title 或含 tgme_page_extra 提示文案 → 永久死信。
             // 前提：响应确实是 Telegram 页面（防代理劫持页/中转异常页把正常用户名误判进死信）
             if (body.contains("tgme", ignoreCase = true) || body.contains("telegram", ignoreCase = true)) {
-                dead += name
+                dead[name] = Unit
                 Log.d(TAG, "webTitles: @$name notFound（页面无 og:title），进死信")
             } else {
                 Log.d(TAG, "webTitles: @$name transient（响应非 TG 页面，疑似链路中转异常）")

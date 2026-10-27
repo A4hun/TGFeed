@@ -237,42 +237,202 @@ internal fun pursueTimelineCutoffSec(nowSec: Long, windowSec: Long, historyFloor
     return if (historyFloorSec > 0L) minOf(rolling, historyFloorSec) else rolling
 }
 
+// ---------------- R418 主轴：发布时间严格升序（index 0=最旧，last=最新） ----------------
+// R418b 撤回倒序：「最新在最底下」用户拍板不变量。扁平流升序：补新/实时推入追加到尾、
+// 历史游标向上（更早）翻。排序键全序稳定：发布秒 asc → chatId asc → messageId asc →
+// key（最终决胜，防 key 异构）。下方纯函数族为 VM 唯一入流/游标/保位口径。
+
+/** R418 时间线全序（升序主轴单一事实源：合并/游标/单测共用） */
+internal val PURSUE_TIMELINE_ORDER: Comparator<VideoItem> =
+    compareBy<VideoItem> { it.dateEpochSec }
+        .thenBy { it.chatId }
+        .thenBy { it.messageId }
+        .thenBy { it.key }
+
 /**
- * 扁平流合并（时间线唯一的入流口径——bootstrap/快车道/实时推入/历史轮共用）：
+ * R418 时间线游标（排序键元组）：指向「已交付的最旧位置」。严格更旧=按
+ * [PURSUE_TIMELINE_ORDER] 排在其后。同秒多条由 chatId/messageId 决胜——
+ * 按元组续页不重不漏（纯秒级游标在同秒批量发布时会重或漏）。
+ */
+internal data class PursueCursor(val dateSec: Long, val chatId: Long, val messageId: Long) {
+    companion object {
+        /** 「某秒整秒已交付」游标：该秒所有条目都不算更旧（下一窗从该秒以下起） */
+        fun belowSecond(sec: Long) = PursueCursor(sec, Long.MIN_VALUE, Long.MIN_VALUE)
+    }
+}
+
+internal fun pursueCursorOf(item: VideoItem) =
+    PursueCursor(item.dateEpochSec.toLong(), item.chatId, item.messageId)
+
+/** 条目是否严格比游标更旧（升序主轴上排在游标之前；游标分页向更早方向推进） */
+internal fun pursueOlderThan(item: VideoItem, cursor: PursueCursor): Boolean {
+    val d = item.dateEpochSec.toLong()
+    if (d != cursor.dateSec) return d < cursor.dateSec
+    if (item.chatId != cursor.chatId) return item.chatId < cursor.chatId
+    return item.messageId < cursor.messageId
+}
+
+/**
+ * 扁平流合并（时间线唯一的入流口径——本地快照/补新/实时推入/历史页共用）：
  * - key 去重**来者覆盖**（同 key 的网络/live 版本字段比索引行更富——playUri/
  *   coverBytes/variants 都在活条目上，覆盖方向保证展示与播放吃最富版本）；
  * - cutoff 过滤（无时间戳条目诚实剔除——无法参与时间语义）；
- * - 升序排（dateEpochSec，平手按 key 稳定）；
- * - 超过 [hardCap] 从最旧侧裁（内存护栏）。
+ * - R418 可见性 [keep]（VisibilityGate.passes：屏蔽频道/不感兴趣/关键词——
+ *   既有条目同样复判，新屏蔽下一次合并即生效）；
+ * - R418b **升序**（[PURSUE_TIMELINE_ORDER]，最新在尾）；**增量**：[existing] 约定已有序
+ *   （本函数产物恒有序），只排 incoming（m log m）再线性双路归并——不整表重排；
+ *   全部晚于旧尾（实时推入常态）退化为尾追加；
+ * - 超过 [hardCap] 从最旧侧（头部）裁（内存护栏）。
  */
 internal fun pursueTimelineMerge(
     existing: List<VideoItem>,
     incoming: List<VideoItem>,
     cutoffSec: Long,
     hardCap: Int = PURSUE_STREAM_HARD_CAP,
+    keep: (VideoItem) -> Boolean = { true },
 ): List<VideoItem> {
     if (existing.isEmpty() && incoming.isEmpty()) return emptyList()
-    val byKey = LinkedHashMap<String, VideoItem>(existing.size + incoming.size)
-    for (it in existing) byKey[it.key] = it
-    for (it in incoming) byKey[it.key] = it
-    val out = ArrayList<VideoItem>(byKey.size)
-    for (it in byKey.values) {
-        if (it.dateEpochSec > 0 && it.dateEpochSec >= cutoffSec) out += it
+    fun ok(it: VideoItem) = it.dateEpochSec > 0 && it.dateEpochSec >= cutoffSec && keep(it)
+    // incoming 内去重（后者覆盖前者）+ 过滤 + 排序（只排增量）
+    val inByKey = LinkedHashMap<String, VideoItem>(incoming.size * 2)
+    for (it in incoming) inByKey[it.key] = it
+    val inc = ArrayList<VideoItem>(inByKey.size)
+    for (it in inByKey.values) if (ok(it)) inc += it
+    inc.sortWith(PURSUE_TIMELINE_ORDER)
+    // 既有：被来者覆盖的 key 让位（来者胜）；cutoff/keep 复判（线性，保持原序）
+    val base = ArrayList<VideoItem>(existing.size)
+    for (it in existing) if (it.key !in inByKey && ok(it)) base += it
+    val out: ArrayList<VideoItem>
+    if (inc.isEmpty()) {
+        out = base
+    } else if (base.isEmpty() || PURSUE_TIMELINE_ORDER.compare(inc.first(), base.last()) > 0) {
+        base.addAll(inc) // 尾追加快路（实时推入/补新常态）
+        out = base
+    } else {
+        out = ArrayList(base.size + inc.size)
+        var i = 0
+        var j = 0
+        while (i < base.size && j < inc.size) {
+            if (PURSUE_TIMELINE_ORDER.compare(base[i], inc[j]) <= 0) out += base[i++] else out += inc[j++]
+        }
+        while (i < base.size) out += base[i++]
+        while (j < inc.size) out += inc[j++]
     }
-    out.sortWith(compareBy({ it.dateEpochSec }, { it.key }))
-    return if (out.size > hardCap) out.drop(out.size - hardCap) else out
+    return if (out.size > hardCap) ArrayList(out.subList(out.size - hardCap, out.size)) else out
 }
 
 /**
- * 实时推入的「新内容」计数（「N 条新内容」胶囊口径）：merged 中**晚于旧流最新
- * 一条**的新 key 数——滚动窗修剪/去重导致的位次重排不算新内容，只有真正
- * append 在用户已见最新端之后的内容才计数（用户不在底部时安静排队）。
+ * 「新内容」计数（底部「N 条新内容」胶囊口径）：merged 中**排在旧流最新一条
+ * 之后**的新 key 数——修剪/去重/历史头部插入不算新内容，只有真正追加在用户已见
+ * 最新端之下的内容才计数（用户不在底部时安静排队）。旧流空=首屏，不计数。
+ * 从尾部倒扫，越过旧最新端即止（O(新增)）。
  */
-internal fun pursueTimelineAppendCount(old: List<VideoItem>, merged: List<VideoItem>): Int {
-    if (merged.size <= old.size) return 0
-    val oldKeys = old.mapTo(HashSet(old.size)) { it.key }
-    val oldNewestSec = old.lastOrNull()?.dateEpochSec ?: 0
-    return merged.count { it.key !in oldKeys && it.dateEpochSec > oldNewestSec }
+internal fun pursueTimelineNewerCount(old: List<VideoItem>, merged: List<VideoItem>): Int {
+    val oldNewest = old.lastOrNull() ?: return 0
+    var n = 0
+    for (k in merged.indices.reversed()) {
+        val it = merged[k]
+        if (PURSUE_TIMELINE_ORDER.compare(it, oldNewest) <= 0) break
+        n++
+    }
+    return n
+}
+
+/** R418b 流更新后的视口动作（纯判定，UI 执行） */
+internal enum class PursueViewportAction { NONE, FOLLOW_BOTTOM, HOLD_ANCHOR }
+
+/**
+ * R418b 跟随/保位判定：
+ * - 用户在底部且尾部有新内容 → 跟随到最新（[PursueViewportAction.FOLLOW_BOTTOM]）；
+ * - 头部插入（历史预取）或用户不在底部时尾部追加 → 按锚 key 保位（不跳）；
+ * - 其余（流未变/首屏由落底逻辑负责）→ 不动。
+ */
+internal fun pursueViewportAction(
+    atBottom: Boolean,
+    oldFirstKey: String?,
+    newFirstKey: String?,
+    oldLastKey: String?,
+    newLastKey: String?,
+): PursueViewportAction {
+    if (oldLastKey == null) return PursueViewportAction.NONE
+    val tailGrew = newLastKey != oldLastKey
+    val headChanged = newFirstKey != oldFirstKey
+    return when {
+        tailGrew && atBottom -> PursueViewportAction.FOLLOW_BOTTOM
+        headChanged || tailGrew -> PursueViewportAction.HOLD_ANCHOR
+        else -> PursueViewportAction.NONE
+    }
+}
+
+/**
+ * R418 历史地板（修剪下界）推进：只有**用户主动翻页**（[history]=true：历史游标页/
+ * 索引分页）带来的窗下内容才下移地板——且必须在本次合并的 cutoff 计算**之前**
+ * 推进（旧实现合并后才推进：窗下历史产物当场被 cutoff 裁掉，地板永不下移=历史
+ * 翻不动）。普通补新/快照的窗下条目不拓地板（滚动窗照常淘汰）。
+ */
+internal fun pursueHistoryFloorAfter(
+    floorSec: Long,
+    incoming: List<VideoItem>,
+    nowSec: Long,
+    windowSec: Long,
+    history: Boolean,
+): Long {
+    if (!history) return floorSec
+    var oldest = Long.MAX_VALUE
+    for (it in incoming) if (it.dateEpochSec > 0) oldest = minOf(oldest, it.dateEpochSec.toLong())
+    if (oldest == Long.MAX_VALUE || oldest >= nowSec - windowSec) return floorSec
+    return if (floorSec <= 0L) oldest else minOf(floorSec, oldest)
+}
+
+/** R418 索引分页单步产物：本步交付条目（升序、严格旧于入参游标）+ 推进后的游标 */
+internal data class PursueIndexStep(val items: List<VideoItem>, val next: PursueCursor)
+
+/**
+ * R418 索引游标分页一步（纯函数；查询窗由 [pursueIndexWindow] 给出）：
+ * - 交付=原始命中中**严格旧于** [cursor] 的条目（同秒按元组决胜——不重）；
+ * - 原始命中未满 [limit]=窗已完整覆盖 → 游标跳到「fromSec 整秒已交付」（下一窗
+ *   从 fromSec 以下继续——窗与窗首尾相接不漏）；
+ * - 满页=窗被截断 → 游标=本步最旧条目（下一窗从它继续——不跳段不漏）；
+ *   病态（满页全是同秒非更旧条目、零进展）→ 让过该秒防死循环。
+ */
+internal fun pursueIndexStep(
+    cursor: PursueCursor,
+    rawHits: List<VideoItem>,
+    fromSec: Long,
+    limit: Int,
+): PursueIndexStep {
+    val fresh = rawHits.filter { it.dateEpochSec > 0 && pursueOlderThan(it, cursor) }
+        .sortedWith(PURSUE_TIMELINE_ORDER)
+    if (rawHits.size < limit) return PursueIndexStep(fresh, PursueCursor.belowSecond(fromSec))
+    // 满页：SQL 只按秒 desc 截断，边界秒 S 内被截掉的条目元组次序任意——
+    // 本步不交付 S 秒条目，游标=「S 秒整秒待取」，下一窗从 S 完整重取（不重不漏）。
+    val boundary = rawHits.filter { it.dateEpochSec > 0 }.minOfOrNull { it.dateEpochSec.toLong() }
+        ?: return PursueIndexStep(fresh, PursueCursor.belowSecond(cursor.dateSec))
+    val above = fresh.filter { it.dateEpochSec.toLong() > boundary }
+    if (above.isEmpty()) {
+        // 病态：整页同秒（>limit 条同秒）——全交付并让过该秒防死循环
+        return PursueIndexStep(fresh, PursueCursor.belowSecond(minOf(boundary, cursor.dateSec)))
+    }
+    return PursueIndexStep(above, PursueCursor(boundary, Long.MAX_VALUE, Long.MAX_VALUE))
+}
+
+/** R418 索引分页查询窗（含两端）：游标秒向下一步；游标秒本身含入（同秒更旧条目靠元组过滤）。越界=null */
+internal fun pursueIndexWindow(cursor: PursueCursor, stepSec: Long): Pair<Long, Long>? {
+    // 「整秒已交付」游标（belowSecond）：该秒无更旧条目可取，窗从下一秒起（否则满页同秒死循环）
+    val wholeSec = cursor.chatId == Long.MIN_VALUE && cursor.messageId == Long.MIN_VALUE
+    val to = if (wholeSec) cursor.dateSec - 1L else cursor.dateSec
+    if (to <= 1L) return null
+    return maxOf(1L, to - stepSec) to to
+}
+
+/**
+ * R418 头部插入/重排保位：新列表中锚卡 key 的下标；锚缺失或已在原位 → null（不滚）。
+ * UI 以首可见卡 key 为锚，列表重算后若锚位移动则 scrollToItem(新下标, 原偏移)。
+ */
+internal fun pursueAnchorRestoreIndex(keys: List<String>, anchorKey: String?, currentIndex: Int): Int? {
+    if (anchorKey == null) return null
+    val idx = keys.indexOf(anchorKey)
+    return if (idx < 0 || idx == currentIndex) null else idx
 }
 
 /**
@@ -369,3 +529,29 @@ private fun cardOf(batch: List<VideoItem>): PursueTimelineCard = PursueTimelineC
     items = batch,
     newestSec = batch.last().dateEpochSec.toLong(),
 )
+
+/**
+ * R418b 卡片流增量分卡：[newStream] 以 [oldStream] 为前缀（逐元素引用相等——尾追加常态）时，
+ * 只从旧末卡首条起重算尾部（末卡可能吸收新条目），其余旧卡原样复用；否则全量重算。
+ * 产物与 [pursueTimelineCards] (newStream) 恒等（单测锚）。
+ */
+internal fun pursueTimelineCardsIncremental(
+    oldStream: List<VideoItem>,
+    oldCards: List<PursueTimelineCard>,
+    newStream: List<VideoItem>,
+    batchGapSec: Long = PURSUE_CARD_BATCH_GAP_SEC,
+): List<PursueTimelineCard> {
+    if (oldStream.isEmpty() || oldCards.isEmpty() || newStream.size < oldStream.size) {
+        return pursueTimelineCards(newStream, batchGapSec)
+    }
+    for (k in oldStream.indices) {
+        if (newStream[k] !== oldStream[k]) return pursueTimelineCards(newStream, batchGapSec)
+    }
+    if (newStream.size == oldStream.size) return oldCards
+    val tailStart = oldStream.size - oldCards.last().items.size
+    val tail = pursueTimelineCards(newStream.subList(tailStart, newStream.size), batchGapSec)
+    val out = ArrayList<PursueTimelineCard>(oldCards.size + tail.size)
+    out.addAll(oldCards.subList(0, oldCards.size - 1))
+    out.addAll(tail)
+    return out
+}

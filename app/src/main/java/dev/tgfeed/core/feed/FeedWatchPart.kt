@@ -242,6 +242,9 @@ internal fun FeedViewModel.recordCoWatchEdge(chatId: Long) {
  *  - 与视频页的 watchingAccum 翻页结算相互独立：本方法只追加事件，不动计时状态。
  */
 internal fun FeedViewModel.recordMediaViewImpl(item: VideoItem, watchMs: Long) {
+    // R392 #5 段尽接棒挂点(图/音播完上抛点):队列源供给尽∧末条播完→段尽消费
+    // 单口(FeedPlayChainPart);画像记账与段尽消费互不干扰,先后无耦合
+    maybeAdvancePlayChainOnMediaEnd(item)
     if (watchMs < MIN_MEDIA_VIEW_MS) return
     val watchSec = (watchMs / 1000L).coerceIn(1L, MAX_WATCH_SEC).toInt()
     val durSec = if (item.durationSec > 0) item.durationSec else watchSec

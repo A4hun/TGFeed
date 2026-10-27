@@ -87,9 +87,9 @@ class GridAspectSpanTest {
         // 互不重叠（单元级位图重放校验）
         val occupied = HashSet<Pair<Int, Int>>()
         for (rect in layout.values) {
-            for (dy in 0 until rect.h) {
-                for (dx in 0 until rect.w) {
-                    val cell = (rect.x + dx) to (rect.y + dy)
+            for (dy in 0 until rect.h.toInt()) {
+                for (dx in 0 until rect.w.toInt()) {
+                    val cell = (rect.x.toInt() + dx) to (rect.y.toInt() + dy)
                     assertTrue("格位重叠：$cell（$rect）", occupied.add(cell))
                 }
             }
@@ -103,7 +103,7 @@ class GridAspectSpanTest {
     fun `混排_横格2x1占双列不越画布右缘`() {
         val (layout, _) = flowLayout(listOf("wide", "a", "b"), mapOf("wide" to (2 to 1)), CANVAS_COLS)
         val wide = layout.getValue("wide")
-        assertEquals(2, wide.w)
+        assertEquals(2f, wide.w)
         assertTrue(wide.x + wide.w <= CANVAS_COLS)
     }
 

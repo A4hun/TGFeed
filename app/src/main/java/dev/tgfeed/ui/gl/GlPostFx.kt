@@ -75,6 +75,7 @@ internal class GlPostFx {
     private var uSceneComp = -1
     private var uBloomComp = -1
     private var uBloomGainComp = -1
+    private var uBodyBloomCutComp = -1
     private var uFlarePosComp = -1
     private var uFlareColorComp = -1
     private var uAspectComp = -1
@@ -114,6 +115,9 @@ internal class GlPostFx {
     /** bloom 亮部软阈值（亮度 0.70~0.95 带——亮星核/光子环/吸积盘内缘/受光高光溢出） */
     private val bloomThreshold = 0.70f
 
+    /** R412d 贴脸恒星本体 bloom 削减比（大面积亮盘处 ×(1−0.45)——不关闭，保表面细节） */
+    private val bodyBloomCut = 0.45f
+
     /**
      * 建成（onSurfaceCreated 调用——旧句柄先释放）。
      * R392：[noiseVolTex]=渲染器烘焙上传的 3D 噪声体句柄——**纹理绑定本体不重复**
@@ -133,6 +137,7 @@ internal class GlPostFx {
         uSceneComp = GLES30.glGetUniformLocation(progComposite, "uScene")
         uBloomComp = GLES30.glGetUniformLocation(progComposite, "uBloom")
         uBloomGainComp = GLES30.glGetUniformLocation(progComposite, "uBloomGain")
+        uBodyBloomCutComp = GLES30.glGetUniformLocation(progComposite, "uBodyBloomCut")
         uFlarePosComp = GLES30.glGetUniformLocation(progComposite, "uFlarePos")
         uFlareColorComp = GLES30.glGetUniformLocation(progComposite, "uFlareColor")
         uAspectComp = GLES30.glGetUniformLocation(progComposite, "uAspect")
@@ -331,6 +336,7 @@ internal class GlPostFx {
         GLES30.glUniform1i(uBloomComp, 1)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glUniform1f(uBloomGainComp, bloomGain)
+        GLES30.glUniform1f(uBodyBloomCutComp, bodyBloomCut)
         GLES30.glUniform1f(uAspectComp, curW.toFloat() / curH.coerceAtLeast(1))
         // 光斑 uniform 数组（≤3 源——空槽强度零）
         flarePosArr.fill(0f)

@@ -31,7 +31,8 @@ import java.io.File
  *       自有 pending 表（边类型缺省 link；被 answer_store / goldmine fresh 引用的
  *       名字改判 group_search——这两个表的数据只可能来自收割管道）；
  *  2. **限流**：与收割主循环共享收割车道 FloodBudget（解析与收割同属被动只读管线，
- *     共用一个 flood 池，防风控口径不变）；每条解析前 tryAcquire 记账，耗尽即收工；
+ *     共用一个 flood 池，防风控口径不变）；每条解析前记账（R378 刀1：辅助车道
+ *     tryAcquireAux，受主收割保底份额约束），耗尽即收工；
  *  3. **持久化**：entity_resolve.json（pending/resolved/dead 三表，@Synchronized
  *     公开方法 + @Volatile 内存缓存唯一事实源 + tmp+rename 原子落盘 + 变更阈值
  *     flush，与 AnswerStore/DiscoveryGraph 全同构），映射与死信重启不丢；
@@ -259,8 +260,16 @@ class EntityResolver(
                     Log.w(TAG, "TDLib 限流（429），本轮收工（已解=$resolvedCount）")
                     break
                 }
+                // R378 刀2：瞬态失败与 FLOOD 同款整轮收工——网络劣化窗（16384 实况
+                // loadCoverBytes 15s 超时连发同族）旧版 else->{} 继续循环=每名 1 令牌
+                // 连烧穿整池的止血口；单名瞬态失败的下轮重试语义不变（attempts 照记，
+                // 3 连败进死信不阻塞队列）
+                Outcome.TRANSIENT -> {
+                    Log.w(TAG, "解析瞬态失败，本轮收工等下轮（网络劣化态止血，已解=$resolvedCount）")
+                    break
+                }
                 Outcome.RESOLVED -> resolvedCount++
-                else -> {}
+                Outcome.DEAD -> {} // 死信终态：单名记账，轮次继续
             }
             delay(RESOLVE_INTERVAL_MS)
         }
@@ -357,10 +366,12 @@ class EntityResolver(
 
     /**
      * 解析一个用户名（预算记账 + TDLib SearchPublicChat + 落地/死信分类）。
-     * 预算是与收割共享的令牌桶：tryAcquire 拒绝即本轮收工，绝不强发。
+     * 预算是与收割共享的令牌桶（R378 刀1+刀2 联动：记账口换辅助车道
+     * [FloodBudget.tryAcquireAux]——L1 辅助上限与 L4 账本双保险；拒绝即本轮
+     * 收工，零记账零强发）。
      */
     private suspend fun resolveOne(name: String): Outcome {
-        if (!budget.tryAcquire()) return Outcome.BUDGET_EXHAUSTED
+        if (!budget.tryAcquireAux()) return Outcome.BUDGET_EXHAUSTED
         val r = gateway.resolvePublicChatByUsername(name)
         if (r.ok) {
             if (adClassifier.isBlocked(r.chatId, name)) {
@@ -606,14 +617,22 @@ class EntityResolver(
         /** 死信原因：瞬态失败连败达上限（坏名字防反复烧预算） */
         private const val DEAD_UNSTABLE = "unstable"
 
-        /** 单轮解析条数上限：与收割共享小时预算，封顶防积压消化把收割预算吃光 */
-        private const val RESOLVE_BATCH_PER_ROUND = 25
+        /**
+         * 单轮解析条数上限（R378 刀2 慢车道：25→5——4000 积压下 25 名/轮的令牌烧速
+         * 在瞬态风暴态可吃满整池；5 名/轮+长间隔把解析降为后台慢消化。消化速度受
+         * L4 BACKGROUND 车道（4/h 基数）+本慢车道双重封顶——账号安全设计，不是
+         * 本批要消灭的对象；加速须走 L4 车道配额另立单）。
+         */
+        private const val RESOLVE_BATCH_PER_ROUND = 5
 
-        /** 逐条解析间隔（毫秒）：平滑请求突发（预算管总量，间隔管瞬时密度） */
+        /** 逐条解析间隔（毫秒）：平滑请求突发（预算管总量，间隔管瞬时密度——分工照旧） */
         private const val RESOLVE_INTERVAL_MS = 1_200L
 
-        /** 有解析成果的轮次后短歇（毫秒）：等滑窗预算回血 */
-        private const val ROUND_DELAY_MS = 60_000L
+        /**
+         * 有解析成果的轮次后短歇（毫秒；R378 刀2 慢车道：60s→300s 长间隔——任务书
+         * 「5 名/轮长间隔」定案，稳态令牌烧速≈授予 4+探针 ≤12/5min ≈ 16/h <辅助上限）
+         */
+        private const val ROUND_DELAY_MS = 300_000L
 
         /** 空转/未就绪巡检周期（毫秒）：新收割入队的名字最迟一个空闲周期被拾取 */
         private const val IDLE_DELAY_MS = 300_000L

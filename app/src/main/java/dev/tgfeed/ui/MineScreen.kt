@@ -34,6 +34,7 @@ import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.PlaylistPlay
 import androidx.compose.material.icons.outlined.Public
+import androidx.compose.material.icons.outlined.QueueMusic
 import androidx.compose.material.icons.outlined.Replay
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Star
@@ -96,6 +97,8 @@ fun MineScreen(
     onOpenSettings: () -> Unit = {},
     onOpenDownloads: () -> Unit = {},
     onOpenPlaylists: () -> Unit = {},
+    // R387 播放队列（节目单）页入口（播放列表旁——同为"我攒的单"语义组）；默认空实现
+    onOpenPlayQueue: () -> Unit = {},
     // 观看历史页入口（放在观看报告旁边）；默认空实现，调用方不接线也可编译
     onOpenWatchHistory: () -> Unit = {},
     // R199 我的收藏页入口（放在播放列表旁——同为"我攒的内容"语义组）；默认空实现
@@ -311,6 +314,13 @@ fun MineScreen(
                         title = "播放列表",
                         subtitle = "自建的片单，整单连播",
                         onClick = onOpenPlaylists,
+                    )
+                    // R387 播放队列→R391 播放台：多套节目单按序连播+口味今日单
+                    MineEntryRow(
+                        icon = Icons.Outlined.QueueMusic,
+                        title = "播放台",
+                        subtitle = "多套节目单，按序连播",
+                        onClick = onOpenPlayQueue,
                     )
                     // R199 我的收藏（收藏查看模块入口）：收藏封面墙——点开回味、
                     // 按频道分组、角标取消；计数徽章=当前收藏数（活流，999+ 封顶）

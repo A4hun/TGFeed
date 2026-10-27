@@ -391,11 +391,8 @@ fun GridScreen(
     // 内容源刻意不再吃 vm.items——那是用户刚在 Feed 刷过的那批，直接用必然重样
     val vm: FeedViewModel = viewModel(factory = FeedViewModelFactory(gateway, app), key = "gw" + System.identityHashCode(gateway))
     val likesState = vm.likes.collectAsState()
-    val likes by likesState
     val favoritesState = vm.favorites.collectAsState()
-    val favorites by favoritesState
     val downloadsState = vm.downloads.collectAsState()
-    val downloads by downloadsState
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val keyboard = LocalSoftwareKeyboardController.current
@@ -638,6 +635,9 @@ fun GridScreen(
     val gridAllowVideos = remember { prefsCoach.showVideos }
     val gridAllowPhotos = remember { prefsCoach.showPhotos }
     val gridAllowAudio = remember { prefsCoach.showAudio }
+    // R415 按行装箱开关（进入分屏时读一次，设置里切换后下次进入生效）
+    val gridJustified = remember { prefsCoach.gridJustifiedRows }
+    gcx.justifiedRows.value = gridJustified
     // 内容分区 tab 配套（用户反馈"分屏也要配套筛选"）：Feed 顶栏选了"音频"进分屏也只放音频格
     val gridMediaTab by vm.mediaTypeTab.collectAsState()
     // 类型 tab 的分屏翻页游标提升到 VM（vm.gridMediaCursorFor / updateGridMediaCursor）：
@@ -721,7 +721,20 @@ fun GridScreen(
     // 流式排位：槽位顺序 × span 表 → 每格的逻辑矩形 + 画布总行数。
     // derivedStateOf 内部读 spans（SnapshotStateMap），span 变化自动重排
     val layoutInfoState = remember {
-        derivedStateOf { flowLayout(orderedSlotIdsState.value, spans, CANVAS_COLS) }
+        derivedStateOf {
+            // R415 按行装箱（默认开）：宽高比取基底内容（换片不触发整画布重排）；
+            // 关闭开关回退旧等分流式排位（span 表/拖柄生效）
+            if (gridJustified) {
+                val byKey = baseByKeyState.value
+                val ids = orderedSlotIdsState.value
+                val aspects = ids.associateWith { id ->
+                    byKey[id]?.let { justifyAspect(it.width, it.height) } ?: JUSTIFY_DEFAULT_ASPECT
+                }
+                justifiedLayout(ids, aspects, CANVAS_COLS, cellW() / cellH())
+            } else {
+                flowLayout(orderedSlotIdsState.value, spans, CANVAS_COLS)
+            }
+        }
     }
     val layoutInfo by layoutInfoState
     val layout = layoutInfo.first
@@ -1162,10 +1175,12 @@ fun GridScreen(
                     slotId = s.slotId,
                     contentKey = s.content.key,
                     chatId = s.content.chatId,
-                    gridX = c?.x ?: 0,
-                    gridY = c?.y ?: 0,
-                    spanW = c?.w ?: 1,
-                    spanH = c?.h ?: 1,
+                    // R415：装箱模式格位为分数，快照只存取整坐标；span 存用户 span 表
+                    // （不把装箱宽度污染回旧模式的 span 记忆）
+                    gridX = c?.x?.toInt() ?: 0,
+                    gridY = c?.y?.toInt() ?: 0,
+                    spanW = if (gridJustified) spans[s.slotId]?.first ?: 1 else c?.w?.toInt() ?: 1,
+                    spanH = if (gridJustified) spans[s.slotId]?.second ?: 1 else c?.h?.toInt() ?: 1,
                 )
             },
             closedKeys = closedKeys,
@@ -1681,6 +1696,13 @@ fun GridScreen(
     // lambda 内现读快照 State（focusedKey/gridSlots 均为 remember 代理，闭包内读取即最新值），
     // 无需随焦点/换片重注册；声明在本 effect、释放在下 effect，dispose 顺序先注销后释放池。
     val container = (context.applicationContext as dev.tgfeed.App).container
+    // R417 播放占有权闸：分屏非持有（频道主页覆盖层压顶等）即全池暂停+记账，回持有续播
+    PlaybackOwnershipGate(
+        pool = playerPool,
+        owner = container.playbackOwner.value,
+        holder = dev.tgfeed.core.playback.PlaybackOwner.GRID,
+        allowAudioVideoSimultaneous = false,
+    )
     DisposableEffect(Unit) {
         val pauser: () -> Unit = {
             // 暂停全部持有播放器的格（pauseAll 比逐 playableKeys 彻底：划出可见区、
@@ -2128,10 +2150,11 @@ private fun GridCanvasViewport(
     val visibleSlotIds by visibleSlotIdsState
     val playableKeys by playableKeysState
     val effectiveFocusedKey by effectiveFocusedKeyState
-    val likes by likesState
-    val favorites by favoritesState
+    // R432 重组收敛：likes/favorites/downloads 三表不再本层 by 委托取值——
+    // 值参链会让下载 1Hz 更新 / 点赞切换把整个可见格循环（全视口）拖进重组。
+    // State 本体直接下传 GridCellDispatch → 格叶子组件，叶子内按 item.key 现查，
+    // 订阅作用域收敛到单格。
     val watchedIds by watchedIdsState
-    val downloads by downloadsState
     val muteAll by muteAllState
     var canvasScale by gcx.canvasScale
     var canvasTx by gcx.canvasTx
@@ -2409,13 +2432,15 @@ private fun GridCanvasViewport(
                         playerPool = playerPool,
                         vm = vm,
                         focused = slot.slotId == effectiveFocusedKey,
-                        liked = item.key in likes,
-                        favorited = item.key in favorites,
+                        // R432：三表传 State 本体（叶子内现查），不在此处取值——
+                        // 循环体读 State 会把全视口循环拖进每次表变更的重组
+                        likes = likesState,
+                        favorites = favoritesState,
                         watched = item.key in watchedIds.first ||
                             (item.fileUniqueId.isNotEmpty() &&
                                 item.fileUniqueId in watchedIds.second),
-                        downloadStatus = downloads[item.key],
-                        volume = volumes[slot.slotId] ?: 1f,
+                        downloads = downloadsState,
+                        volumes = volumes,
                         muteAll = muteAll,
                         // R230 ⑥ 手动播放授权口（两步制第二步/失败格重试
                         // 都走这里）：满 MAX_GRID_PLAYERS 路 Toast 拒绝
@@ -2498,7 +2523,7 @@ private fun GridCanvasViewport(
                 val base = layout[rk]
                 if (base != null) {
                     // 目标宽度超出画布右缘时把预览框左移回画布内
-                    val px = (if (base.x + rs.first > CANVAS_COLS) CANVAS_COLS - rs.first else base.x) * unitW
+                    val px = (if (base.x + rs.first > CANVAS_COLS) (CANVAS_COLS - rs.first).toFloat() else base.x) * unitW
                     val py = base.y * unitH
                     Canvas(
                         Modifier
@@ -2584,7 +2609,8 @@ private fun GridCanvasViewport(
         // 拖动中保持显示（柄自身 scale 1.15、描边变红 = 调整语义反馈，§4.4）
         val focusCell = effectiveFocusedKey?.let { layout[it] }
         // PK 擂台模式格位钉死 2×2，调整大小无意义：拖柄整体隐藏
-        if (!pkMode && focusCell != null && dragKey == null &&
+        // R415 按行装箱模式格宽由宽高比决定，span 拖柄无意义：同样隐藏
+        if (!pkMode && !gcx.justifiedRows.value && focusCell != null && dragKey == null &&
             (resizeKey == null || resizeKey == effectiveFocusedKey) &&
             effectiveFocusedKey in visibleSlotIds
         ) {
@@ -2743,6 +2769,9 @@ private class GridUiCtx(
 
     /** 擂台开关：开启后画布只留左右两个大格对播；仅会话内记忆，不落库 */
     val pkMode: MutableState<Boolean> = mutableStateOf(false)
+
+    /** R415 按行装箱模式（进入时由 AppPrefs.gridJustifiedRows 写入；开时隐藏 span 拖柄） */
+    val justifiedRows: MutableState<Boolean> = mutableStateOf(true)
 
     /** 擂台槽位对：进入时从当前可见槽位快照前 2 个（退出清空） */
     val pkSlotIds: MutableState<List<String>> = mutableStateOf(listOf())

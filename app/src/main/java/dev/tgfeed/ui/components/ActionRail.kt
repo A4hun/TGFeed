@@ -32,6 +32,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,7 +70,12 @@ import kotlin.math.roundToInt
 internal fun ActionRail(
     liked: Boolean,
     favorited: Boolean,
-    downloadStatus: DownloadStatus?,
+    // R432 重组收敛：下载表 State 本体下传 + 条目 key，本组件内现查——
+    // 原 downloadStatus 值参链（FeedScreen → VideoPage → 本栏）让下载 1Hz 进度
+    // 更新把整页拖进重组；改 State 后订阅作用域收敛到本栏，进度只在
+    // RailItem 行内刷新
+    downloads: State<Map<String, DownloadStatus>>,
+    downloadKey: String,
     // R175：分享（原长按面板按钮原样搬来）→ 2026-10-16 改直跳系统分享 → R201 整合：
     // 点按弹分享枢纽小菜单（ShareHubSheet 三选一：复制链接/分享到其他应用/分享卡片），
     // 与 FeedScreen.onOpenShareHub 同一回调链，链体在枢纽接线收口
@@ -144,6 +150,8 @@ internal fun ActionRail(
             contentDescription = if (favorited) "已收藏" else "收藏",
         )
         // 下载按状态换图标：未下载 ↓ / 下载中转圈 / 已完成 ✓ / 失败 ⚠（点按重试）
+        // R432：叶子查表点（本栏组合期单次读，1Hz 进度更新只重组本 RailItem）
+        val downloadStatus = downloads.value[downloadKey]
         when (downloadStatus) {
             null -> RailIcon(
                 Icons.Outlined.FileDownload, TgFeedTokens.TextHigh, "", onDownload,

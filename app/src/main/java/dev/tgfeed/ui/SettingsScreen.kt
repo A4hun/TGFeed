@@ -221,6 +221,8 @@ fun SettingsScreen(
     var showVideos by remember { mutableStateOf(prefs.showVideos) }
     var showPhotos by remember { mutableStateOf(prefs.showPhotos) }
     var showAudio by remember { mutableStateOf(prefs.showAudio) }
+    // R415 分屏按比例装箱开关镜像
+    var gridJustifiedRows by remember { mutableStateOf(prefs.gridJustifiedRows) }
     // 缓存上限输入框镜像 prefs；非法输入只在本地停留，不落盘
     var cacheLimitGb by remember { mutableStateOf(prefs.cacheLimitGb.toString()) }
     // 搜索机器人用户名输入框镜像 prefs；即时保存（setter 内 trim + 去 @，空白读取侧回落默认）
@@ -504,6 +506,16 @@ fun SettingsScreen(
                         )
                     }
                 }
+                // R415 分屏格子按视频比例按行装箱（关 = 回退旧等分格位）
+                SettingsSwitchRow(
+                    title = "分屏按视频比例排布（默认开）",
+                    subtitle = "格子宽度按视频横竖比例分配、同行等高铺满；关闭恢复等分格子（可拖柄调大小），重进分屏生效",
+                    checked = gridJustifiedRows,
+                    onCheckedChange = {
+                        gridJustifiedRows = it
+                        prefs.gridJustifiedRows = it
+                    },
+                )
                 // 重置手势引导标记：回 Feed/分屏时重新显示一次
                 SettingsActionRow(
                     icon = Icons.Outlined.TouchApp,
@@ -767,6 +779,25 @@ fun SettingsScreen(
                         "频率：频道更新每 15 分钟检查一次；关键词到货即时提醒。\n生效：翻转后下一轮" +
                         "检查起（追更侧即时同步内存态）。\n已知取舍：需要系统通知权限（没授权时" +
                         "到系统设置里开启）。",
+                )
+                // R420 后台定时同步：点按在 关闭/15/30/60 分钟间轮换，即时重排 WorkManager 周期任务
+                var bgSyncMin by remember {
+                    mutableStateOf(dev.tgfeed.core.sync.BackgroundSyncPolicy.normalizeMinutes(prefs.backgroundSyncMinutes))
+                }
+                SettingsSwitchRow(
+                    title = "后台定时同步：${if (bgSyncMin == 0) "关闭" else "每 ${bgSyncMin} 分钟"}",
+                    subtitle = "不打开 App 也定期把关注频道新内容拉到本地（点按切换 关闭/15/30/60 分钟）",
+                    checked = bgSyncMin > 0,
+                    onCheckedChange = {
+                        val opts = dev.tgfeed.core.sync.BackgroundSyncPolicy.OPTIONS
+                        val next = opts[(opts.indexOf(bgSyncMin) + 1) % opts.size]
+                        bgSyncMin = next
+                        prefs.backgroundSyncMinutes = next
+                        runCatching { dev.tgfeed.core.sync.BackgroundSyncScheduler.apply(context, next) }
+                    },
+                    help = "做什么：App 在后台时按间隔只读拉取关注频道最新消息头，写入本地快照，打开即最新。\n" +
+                        "默认：每 30 分钟。\n条件：有网络且电量不低；App 在前台时跳过（前台自有刷新）；" +
+                        "不下载媒体，计量网络同样只拉消息头。\n单次最长 8 分钟，超时即退出。",
                 )
                 // R356 口味星图设置整体内迁（用户 08:1x 拍板：设置不该放星图
                 // 的东西——五行退役：互链聚拢/互链连线/涌现布局/星座/宇宙底幕；
@@ -1969,6 +2000,11 @@ fun SettingsScreen(
                 }
             }
 
+            // ---------------- R413：关键词屏蔽（用户自定义屏蔽词，广告内容过滤） ----------------
+            SettingsCard("关键词屏蔽") {
+                KeywordMuteSettingsContent(vm)
+            }
+
             // ---------------- 关于（版本信息 / 开源许可 / 项目主页；业界惯例置底） ----------------
             // 版本行直达关于页：版本号与构建变体实读 BuildConfig（版本名+内部版本号+变体如实），
             // 点行进入关于页看版本详情、检查更新、开源许可与免责要点
@@ -2231,7 +2267,7 @@ fun SettingsScreen(
 // ==================== 以下为设置页私有组件 ====================
 
 /** 开关配色：M3 默认未选中态轨道是 surfaceVariant（=SurfaceHigh），贴在卡片底上几乎隐形，需显式提亮 */
-private val settingsSwitchColors: SwitchColors
+internal val settingsSwitchColors: SwitchColors
     @Composable
     get() = SwitchDefaults.colors(
         checkedThumbColor = Color.White,

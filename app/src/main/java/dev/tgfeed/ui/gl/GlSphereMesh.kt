@@ -30,6 +30,20 @@ internal object GlSphereMesh {
     /** 纬向层数——R349 低模档 */
     const val LOD_STACKS = 6
 
+    /**
+     * R409b 高模贴脸档经向切片数（96×64=12288 三角；顶点 97×65=6305 < Short 上限）。
+     * 用户「近距离看恒星建模精度低」：24 切剪影弦高 r(1−cos(π/24))≈0.0086r——屏半径
+     * 1000px 时折边≈8.6px 肉眼可辨；96 切≈0.00054r≈0.5px=亚像素。仅屏半径超
+     * [HI_MIN_RADIUS_PX] 的全模真球/行星换此档（远中档零变化）。
+     */
+    const val HI_SLICES = 96
+
+    /** R409b 高模贴脸档纬向层数 */
+    const val HI_STACKS = 64
+
+    /** R409b 换高模门槛（屏半径 px）：24 切在此半径弦高≈0.9px——门内全模已亚像素级 */
+    const val HI_MIN_RADIUS_PX = 100f
+
     /** 顶点数 = (STACKS+1)×(SLICES+1)（纬向接缝复制一列——零接缝处理） */
     val vertexCount: Int get() = (STACKS + 1) * (SLICES + 1)
 

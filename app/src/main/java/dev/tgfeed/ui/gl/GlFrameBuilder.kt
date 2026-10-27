@@ -117,6 +117,9 @@ internal class GlFrameBuilder {
         /** 全模真球帽（R349 后语义收窄：**全模/逐实例 uniform 路径帽**——r≥8px
          *  贴脸档；低模批档走 [MAX_SPHERE_I] 独立帽。日冕同帽（贴脸件）） */
         const val MAX_SPHERES = 48
+
+        /** R406 恒星全模球籍上限（MAX_SPHERES 减视界黑球余量 8——黑洞视界同池共帽） */
+        const val FULL_SPHERE_SEL_CAP = MAX_SPHERES - 8
         const val MAX_OPS = 1024
 
         /** draw op 类型（渲染器回放分发） */
@@ -553,6 +556,13 @@ internal class GlFrameBuilder {
     private val lowSelScore = FloatArray(MAX_SPHERE_I)
     private val lowSelIdx = IntArray(MAX_SPHERE_I)
     private var lowSelN = 0
+
+    /** R406 全模球籍预选位（星索引→true=本帧持全模籍——屏径降序 top-[FULL_SPHERE_SEL_CAP]；
+     *  落选大星并入低模池仍为 3D 真球，杜绝帽满回点档=平涂白饼） */
+    private var fullSphereOk = BooleanArray(0)
+    private val fullSelScore = FloatArray(FULL_SPHERE_SEL_CAP)
+    private val fullSelIdx = IntArray(FULL_SPHERE_SEL_CAP)
+    private var fullSelN = 0
 
     /** R339 星芒门候选数（探针/单测锚——点形态个体绘制星
      *  [lodPointCeilPx]≤r<effectiveSolidFloor 的亮度 top 门域（R349 形态线/R355
@@ -2952,17 +2962,42 @@ internal class GlFrameBuilder {
     private fun selectLowSpheresR349(stars: List<dev.tgfeed.ui.TasteFxStar>, visN: Int) {
         if (lowSphereOk.size < stars.size) {
             lowSphereOk = BooleanArray(stars.size)
+            fullSphereOk = BooleanArray(stars.size)
         } else {
             java.util.Arrays.fill(lowSphereOk, 0, stars.size, false)
+            java.util.Arrays.fill(fullSphereOk, 0, stars.size, false)
         }
+        // ---- R406 全模球籍预选（白色圆饼根因正治）：旧件全模帽 MAX_SPHERES 按
+        //      pass2 远→近画家序先到先得——近景大星最后到=帽满被踢回点档，点档
+        //      在球门上 coreSwell=1 整盘核色=**平涂白/灰圆饼**（像素实锚：盘内
+        //      255 平台+硬边；探针「全模球=48」常年顶帽）。修式=屏径降序预选
+        //      top-[FULL_SPHERE_SEL_CAP]（留视界黑球余量），落选者并入低模池仍是
+        //      3D 真球，最后才回点档 ----
+        fullSelN = 0
+        for (vi in 0 until visN) {
+            val slot = order[vi]
+            val rPx = pR[slot]
+            if (rPx < lodLowMeshMaxPx) continue
+            if (fullSelN >= FULL_SPHERE_SEL_CAP && rPx <= fullSelScore[FULL_SPHERE_SEL_CAP - 1]) continue
+            var k = if (fullSelN < FULL_SPHERE_SEL_CAP) fullSelN else FULL_SPHERE_SEL_CAP - 1
+            if (fullSelN < FULL_SPHERE_SEL_CAP) fullSelN++
+            while (k > 0 && fullSelScore[k - 1] < rPx) {
+                fullSelScore[k] = fullSelScore[k - 1]
+                fullSelIdx[k] = fullSelIdx[k - 1]
+                k--
+            }
+            fullSelScore[k] = rPx
+            fullSelIdx[k] = slotStar[slot]
+        }
+        for (k in 0 until fullSelN) fullSphereOk[fullSelIdx[k]] = true
         val cap = lodInstanceCap.coerceAtMost(MAX_SPHERE_I)
         lowSelN = 0
         for (vi in 0 until visN) {
             val slot = order[vi]
             val rPx = pR[slot]
             if (rPx < lodPointCeilPx) continue
-            if (rPx >= lodLowMeshMaxPx) continue
             val si = slotStar[slot]
+            if (rPx >= lodLowMeshMaxPx && fullSphereOk[si]) continue // 全模持籍者不占低模籍
             if (lowSelN >= cap && rPx <= lowSelScore[cap - 1]) continue
             var k = if (lowSelN < cap) lowSelN else cap - 1
             if (lowSelN < cap) lowSelN++
@@ -3469,7 +3504,9 @@ internal class GlFrameBuilder {
         //      （α×0.92 与球 α 本就能量配平——帽界换籍帧间跳变 ≤8% 预算内）；
         //      R355 dp 化=窗两端帧字段透传） ----
         val k = TasteLodPolicy.blend01(r, lodSolidFloorPx, lodPointCeilPx)
-        val solidLow = r < lodLowMeshMaxPx
+        // R406：全模落选大星并入低模批（仍是 3D 真球——帽满不再回点档平涂白饼）
+        val solidLow = r < lodLowMeshMaxPx ||
+            (si >= 0 && si < fullSphereOk.size && !fullSphereOk[si])
         // 球形态可用性先判（点 alpha 依赖——帽满/无籍=回点档全亮）
         val spherePossible = k > 0.01f && (
             if (solidLow) {

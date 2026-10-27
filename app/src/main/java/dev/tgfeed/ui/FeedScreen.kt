@@ -164,7 +164,10 @@ fun FeedScreen(
     val lastFreshAtMs by vm.lastFreshAtMs.collectAsState()
     val likes by vm.likes.collectAsState()
     val favorites by vm.favorites.collectAsState()
-    val downloads by vm.downloads.collectAsState()
+    // R432 重组收敛：下载表只 collect 不在此取值——值参链（本层 downloads[key] →
+    // VideoPage/PhotoCard/AudioCard → ActionRail）会让下载 1Hz 进度更新把整页
+    // （含本处 pager 循环）拖进重组。State 本体下传，卡片叶子内按 item.key 现查。
+    val downloadsState = vm.downloads.collectAsState()
     val subscriptions by vm.subscriptions.collectAsState()
     // R66 追更红点：任一订阅频道有未看新内容 → 顶栏"订阅追更"chip 叠小红点
     val followHasNew by vm.followHasNew.collectAsState()
@@ -751,31 +754,16 @@ fun FeedScreen(
     // 实测实锤整条 feed 在频道主页之下 autoAdvance 连锁连播近 10 分钟（r180_notes ③）。
     // 回页恢复口径：池侧"记账（落闸前在播的）+拦截（闸期被吃掉的自动起播）"合并恢复；
     // 音频侧本闸只记 playWhenReady=true 的（用户本来就暂停着的不动）。
-    var navPausedVideoKeys by remember { mutableStateOf<List<String>>(emptyList()) }
-    var navPausedAudio by remember { mutableStateOf(false) }
-    val navDecision = dev.tgfeed.core.playback.navPauseDecision(
-        feedPageActive = appContainer.feedPageActive.value && !storiesViewerOpen,
+    // R417：私有导航闸收敛进共享件 PlaybackOwnershipGate（持有者=FEED；页内快拍满屏
+    // 压顶=localYield 让位）——修旧闸重复落闸时空账本覆盖记账的漏恢复
+    PlaybackOwnershipGate(
+        pool = playerPool,
+        owner = appContainer.playbackOwner.value,
+        holder = dev.tgfeed.core.playback.PlaybackOwner.FEED,
         allowAudioVideoSimultaneous = prefs.allowAudioVideoSimultaneous,
+        localYield = storiesViewerOpen,
+        audioPlayer = audioPlayer,
     )
-    LaunchedEffect(navDecision) {
-        if (navDecision.pausesVideo || navDecision.pausesAudio) {
-            if (navDecision.pausesVideo) {
-                // 落闸（一刀切+记账；闸期迟到的自动起播由池监听器拦截并记入池侧账）
-                navPausedVideoKeys = playerPool.setNavGate(true)
-            }
-            if (navDecision.pausesAudio && audioPlayer.playWhenReady) {
-                audioPlayer.pause()
-                navPausedAudio = true
-            }
-        } else {
-            playerPool.setNavGate(false, navPausedVideoKeys)
-            navPausedVideoKeys = emptyList()
-            if (navPausedAudio) {
-                audioPlayer.play()
-                navPausedAudio = false
-            }
-        }
-    }
     // 横滑切页/进子页路由会让本页整个 dispose（R177 离场制）——导航闸 effect 随组合
     // 消亡（新决策来不及跑），池的 releaseAll 仍是那条路的视频停播点；音频在 dispose
     // 点按矩阵收口：共存关=暂停不清状态（回页迷你条可续），开=豁免继续播（背景听）。
@@ -1698,7 +1686,7 @@ fun FeedScreen(
                         liked = item.key in likes,
                         onToggleLike = { vm.toggleLike(item) },
                         favorited = item.key in favorites,
-                        downloadStatus = downloads[item.key],
+                        downloads = downloadsState,
                         onToggleFavorite = { vm.toggleFavorite(item) },
                         onDownload = { vm.download(item) },
                         // R299 B2/B3：查看器保存原图（按当前显示页条目，图集内横滑后
@@ -1801,7 +1789,7 @@ fun FeedScreen(
                         // v6 音频卡重做：底部操作排（点赞/收藏/下载/分享）与视频卡同一套回调
                         liked = item.key in likes,
                         favorited = item.key in favorites,
-                        downloadStatus = downloads[item.key],
+                        downloads = downloadsState,
                         onToggleLike = { vm.toggleLike(item) },
                         onToggleFavorite = { vm.toggleFavorite(item) },
                         onDownload = { vm.download(item) },
@@ -1877,7 +1865,7 @@ fun FeedScreen(
                         playerPool = playerPool,
                         liked = item.key in likes,
                         favorited = item.key in favorites,
-                        downloadStatus = downloads[item.key],
+                        downloads = downloadsState,
                         muted = muted,
                         speed = speed,
                         speedLabel = formatSpeed(speed),
